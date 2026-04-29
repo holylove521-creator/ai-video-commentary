@@ -130,7 +130,7 @@ class ScriptGenerator:
     @staticmethod
     def _slim_scenes(scenes: list[dict]) -> list[dict]:
         """精简场景数据，仅保留 LLM 需要的字段以减少 token 消耗。"""
-        keep = {"start", "end", "scene_desc", "action", "emotion", "avg_highlight_score"}
+        keep = {"start", "end", "scene_desc", "action", "emotion", "avg_highlight"}
         return [
             {k: v for k, v in scene.items() if k in keep}
             for scene in scenes
@@ -238,13 +238,13 @@ if __name__ == "__main__":
                 "start": 0.0, "end": 5.0,
                 "scene_desc": "玩家进入地图，四处张望",
                 "action": "移动", "emotion": "calm",
-                "avg_highlight_score": 3.0,
+                "avg_highlight": 3.0,
             },
             {
                 "start": 5.0, "end": 12.0,
                 "scene_desc": "突然遭遇敌方，激烈交火",
                 "action": "战斗", "emotion": "excited",
-                "avg_highlight_score": 8.5,
+                "avg_highlight": 8.5,
             },
         ]
         style = sys.argv[1] if len(sys.argv) > 1 else "game"

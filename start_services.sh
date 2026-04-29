@@ -117,6 +117,52 @@ SCRIPT_PID=$!
 echo "script_server $SCRIPT_PID" >> "$PID_FILE"
 log_info "脚本服务器 PID: $SCRIPT_PID"
 
+# ---------- 启动快速粗筛服务（VL-7B，如果启用场景检测）----------
+SCENE_DETECTION=$(python3 -c "
+import yaml
+c = yaml.safe_load(open('$CONFIG_FILE'))
+print(c.get('scene_detection', {}).get('enabled', False))
+" 2>/dev/null || echo "False")
+
+FAST_PID=""
+FAST_PORT=""
+if [ "$SCENE_DETECTION" = "True" ]; then
+    FAST_MODEL=$(python3 -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['vl_server_fast']['model_path'])")
+    FAST_MMPROJ=$(python3 -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['vl_server_fast']['mmproj_path'])")
+    FAST_PORT=$(python3 -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['vl_server_fast']['port'])")
+    FAST_CTX=$(python3 -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['vl_server_fast']['ctx_size'])")
+    FAST_PARALLEL=$(python3 -c "import yaml; c=yaml.safe_load(open('$CONFIG_FILE')); print(c['vl_server_fast']['parallel'])")
+
+    if [ ! -f "$FAST_MODEL" ]; then
+        log_error "找不到 VL-7B 模型: $FAST_MODEL"
+        log_warn "   → 请修改 config/model_config.yaml 中的 vl_server_fast.model_path"
+        log_warn "   → 或将 scene_detection.enabled 设为 false 禁用两阶段模式"
+        exit 1
+    fi
+    if [ ! -f "$FAST_MMPROJ" ]; then
+        log_error "找不到 VL-7B mmproj: $FAST_MMPROJ"
+        log_warn "   → 请修改 config/model_config.yaml 中的 vl_server_fast.mmproj_path"
+        log_warn "   → 或将 scene_detection.enabled 设为 false 禁用两阶段模式"
+        exit 1
+    fi
+
+    log_info "启动快速粗筛服务 VL-7B (端口 $FAST_PORT, 并发 $FAST_PARALLEL)..."
+    llama-server \
+      --model "$FAST_MODEL" \
+      --mmproj "$FAST_MMPROJ" \
+      --host 0.0.0.0 \
+      --port "$FAST_PORT" \
+      --n-gpu-layers 999 \
+      --ctx-size "$FAST_CTX" \
+      --batch-size 512 \
+      --parallel "$FAST_PARALLEL" \
+      --log-disable \
+      > /tmp/ai_video_fast_server.log 2>&1 &
+    FAST_PID=$!
+    echo "fast_server $FAST_PID" >> "$PID_FILE"
+    log_info "快速粗筛服务 PID: $FAST_PID"
+fi
+
 # ---------- 健康检查（最多等待 60 秒）----------
 log_info "等待服务就绪（最多 60 秒）..."
 
@@ -129,6 +175,12 @@ TIMEOUT=60
 ELAPSED=0
 VL_READY=false
 SCRIPT_READY=false
+FAST_READY=false
+
+# 若未启用场景检测，跳过 fast server 检查
+if [ -z "$FAST_PORT" ]; then
+    FAST_READY=true
+fi
 
 while [ $ELAPSED -lt $TIMEOUT ]; do
     if ! $VL_READY && check_health "$VL_PORT"; then
@@ -139,7 +191,11 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
         log_success "脚本服务器就绪 (http://$SCRIPT_HOST:$SCRIPT_PORT)"
         SCRIPT_READY=true
     fi
-    if $VL_READY && $SCRIPT_READY; then
+    if ! $FAST_READY && check_health "$FAST_PORT"; then
+        log_success "快速粗筛服务就绪 (http://localhost:$FAST_PORT)"
+        FAST_READY=true
+    fi
+    if $VL_READY && $SCRIPT_READY && $FAST_READY; then
         break
     fi
     sleep 2
@@ -147,15 +203,21 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
 done
 
 echo ""
-if $VL_READY && $SCRIPT_READY; then
+if $VL_READY && $SCRIPT_READY && $FAST_READY; then
     log_success "╔══════════════════════════════════════╗"
     log_success "║   所有服务已成功启动！               ║"
     log_success "║   VL Server:     http://$VL_HOST:$VL_PORT     ║"
     log_success "║   Script Server: http://$SCRIPT_HOST:$SCRIPT_PORT    ║"
+    if [ -n "$FAST_PORT" ]; then
+        log_success "║   Fast Server:   http://localhost:$FAST_PORT  ║"
+    fi
     log_success "╚══════════════════════════════════════╝"
     log_info "使用 'bash stop_services.sh' 停止服务"
 else
     log_warn "部分服务可能未完全就绪，请检查日志："
     log_warn "  VL 服务器:     /tmp/ai_video_vl_server.log"
     log_warn "  脚本服务器:    /tmp/ai_video_script_server.log"
+    if [ -n "$FAST_PORT" ]; then
+        log_warn "  快速粗筛服务:  /tmp/ai_video_fast_server.log"
+    fi
 fi

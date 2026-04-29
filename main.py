@@ -53,7 +53,7 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
         args:   命令行参数解析结果。
         config: 全局配置字典。
     """
-    from utils.llm_client import create_clients
+    from utils.llm_client import create_clients, create_fast_client
     from utils.vram_manager import VRAMManager
     from pipeline.stage1_understanding import VideoUnderstanding
     from pipeline.stage2_scriptgen import ScriptGenerator
@@ -66,6 +66,7 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
 
     # 创建 LLM 客户端
     vl_client, script_client = create_clients(config)
+    fast_vl_client = create_fast_client(config)
 
     try:
         # ----------------------------------------------------------
@@ -74,7 +75,7 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
         logger.info("=" * 60)
         logger.info("Stage 1/4 ▶ 视频理解与场景分析")
         t1 = time.time()
-        stage1 = VideoUnderstanding(vl_client, config)
+        stage1 = VideoUnderstanding(vl_client, config, fast_vl_client=fast_vl_client)
         scenes = await stage1.analyze_video(
             args.input, fps_sample=args.fps
         )
@@ -95,6 +96,8 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
     finally:
         await vl_client.close()
         await script_client.close()
+        if fast_vl_client is not None and fast_vl_client is not vl_client:
+            await fast_vl_client.close()
         vram.force_gc()
 
     # ----------------------------------------------------------

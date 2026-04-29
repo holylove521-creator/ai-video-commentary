@@ -38,11 +38,32 @@ whisper:
 
 # ---- 视频处理参数 ----
 video:
-  fps_sample: 1.0         # 抽帧频率（帧/秒）
-  frame_quality: 85       # JPEG 质量（0-100）
-  max_concurrent_frames: 4  # 并发 VL 推理帧数
-  output_codec: h264_nvenc  # NVIDIA 硬件编码
-  output_crf: 23          # 编码质量（越低质量越高）
+  fps_sample: 1.0             # 传统模式使用，两阶段模式下此项被场景检测替代
+  frame_quality: 85           # JPEG 质量（0-100）
+  fast_resize: [1280, 720]    # Phase 1 粗筛分辨率（720p）
+  deep_resize: [1920, 1080]   # Phase 2 精分分辨率（1080p）
+  max_concurrent_frames: 8    # Phase 1 VL-7B 并发数
+  max_concurrent_deep: 2      # Phase 2 VL-32B 并发数
+  output_codec: h264_nvenc    # NVIDIA 硬件编码
+  output_crf: 23              # 编码质量（越低质量越高）
+
+# ---- 场景变化检测参数 ----
+scene_detection:
+  enabled: true               # true=两阶段流水线，false=传统逐帧
+  threshold: 0.4              # 直方图差异阈值（0-1，越小越敏感）
+  min_scene_gap: 2.0          # 最短场景间隔（秒），避免重复采样
+  top_score_threshold: 7      # Phase 1 粗筛后，≥ 此分进入 32B 精分
+
+# ---- 视觉语言模型快速粗筛服务（Stage 1 Phase 1，VL-7B）----
+vl_server_fast:
+  model_path: /path/to/models/Qwen2.5-VL-7B-Instruct-Q5_K_M.gguf  # ← 改为实际路径
+  mmproj_path: /path/to/models/mmproj-Qwen2.5-VL-7B-f16.gguf       # ← 改为实际路径
+  host: 0.0.0.0
+  port: 8083
+  n_gpu_layers: 999
+  ctx_size: 4096
+  batch_size: 512
+  parallel: 8                 # 7B 模型 ~5.5GB，可跑 8 并发（48GB 显存安全）
 
 # ---- 路径配置 ----
 paths:
