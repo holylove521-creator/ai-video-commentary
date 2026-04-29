@@ -121,7 +121,7 @@ class TTSEngine:
 
         try:
             import torchaudio  # type: ignore
-            if self._ref_audio and Path(self._ref_audio).exists():
+            if self._ref_audio is not None:
                 # 声音克隆模式
                 result = self._model.inference_zero_shot(
                     tts_text=tts_text,

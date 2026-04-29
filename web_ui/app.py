@@ -36,7 +36,7 @@ def _log_sink(message) -> None:
     """loguru sink，将日志追加到全局缓冲区。"""
     _LOG_BUFFER.append(message.strip())
     if len(_LOG_BUFFER) > _MAX_LOG_LINES:
-        del _LOG_BUFFER[:-_MAX_LOG_LINES]
+        _LOG_BUFFER[:] = _LOG_BUFFER[-_MAX_LOG_LINES:]
 
 
 logger.add(_log_sink, format="{time:HH:mm:ss} | {level:<7} | {message}")
