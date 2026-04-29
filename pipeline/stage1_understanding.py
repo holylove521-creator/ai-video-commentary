@@ -13,7 +13,6 @@ Stage 1: 视频理解与场景分析
 
 import asyncio
 import json
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -101,12 +100,16 @@ class VideoUnderstanding:
                 temperature=0.1,
                 max_tokens=256,
             )
-            # 容错：提取第一个 JSON 对象
-            match = re.search(r"\{.*?\}", raw, re.DOTALL)
-            if match:
-                analysis = json.loads(match.group())
-            else:
-                raise ValueError(f"未找到 JSON: {raw[:200]}")
+            # 容错：先尝试直接解析，再提取第一个完整 JSON 对象（从第一个 { 到最后一个 }）
+            try:
+                analysis = json.loads(raw)
+            except json.JSONDecodeError:
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    analysis = json.loads(raw[start : end + 1])
+                else:
+                    raise ValueError(f"未找到 JSON: {raw[:200]}")
         except (json.JSONDecodeError, ValueError, Exception) as exc:
             logger.warning(
                 f"[Stage1] 帧 {frame['frame_idx']} 分析失败: {exc}，使用默认值"

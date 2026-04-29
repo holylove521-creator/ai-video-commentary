@@ -5,7 +5,7 @@
 # ---- 视觉语言模型服务（Stage 1：视频理解）----
 vl_server:
   model_path: models/Qwen2.5-VL-32B-Instruct-Q5_K_M.gguf
-  mmproj_path: models/Qwen2.5-VL-32B-Instruct-mmproj-f16.gguf
+  mmproj_path: models/mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf
   host: 127.0.0.1
   port: 8080
   n_gpu_layers: 999       # 全部层卸载 GPU

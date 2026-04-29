@@ -49,7 +49,9 @@ class TTSEngine:
         self._model_path: str = tts_cfg.get("model_path", "models/CosyVoice2-0.5B")
         self._default_voice: str = tts_cfg.get("default_voice", "zh-cn-female-1")
         self._sample_rate: int = int(tts_cfg.get("sample_rate", 22050))
-        self._ref_audio: Optional[str] = ref_audio
+        self._ref_audio: Optional[str] = (
+            self._resolve_safe_path(ref_audio) if ref_audio else None
+        )
 
         self._model = None          # 延迟加载
         self._cosyvoice_available = False
@@ -134,13 +136,20 @@ class TTSEngine:
                     spk_id=self._default_voice,
                     stream=False,
                 )
+            saved = False
             for batch in result:
                 torchaudio.save(
                     out_path,
                     batch["tts_speech"],
                     self._model.sample_rate,
                 )
+                saved = True
                 break  # 取第一批输出
+            if not saved:
+                logger.warning(
+                    f"[Stage3] 段落 {segment_idx} TTS 生成器返回空结果，生成静音"
+                )
+                self._write_silence(out_path, duration=3.0)
         except Exception as exc:
             logger.error(f"[Stage3] 段落 {segment_idx} 合成失败: {exc}，生成静音")
             self._write_silence(out_path, duration=3.0)
@@ -198,9 +207,32 @@ class TTSEngine:
             wf.setframerate(self._sample_rate)
             wf.writeframes(b"\x00\x00" * n_frames)
 
+    @staticmethod
+    def _resolve_safe_path(path: str) -> str:
+        """解析并验证文件路径，防止路径注入。
+
+        确保路径为已存在的普通文件，并返回其绝对路径。
+
+        Args:
+            path: 用户提供的文件路径字符串。
+
+        Returns:
+            解析后的绝对路径字符串。
+
+        Raises:
+            ValueError: 路径不存在或不是普通文件。
+        """
+        resolved = Path(path).resolve()
+        if not resolved.is_file():
+            raise ValueError(
+                f"参考音频路径无效或不是普通文件: {path}"
+            )
+        return str(resolved)
+
     def _load_ref_audio(self):
         """加载并重采样参考音频为 16kHz，供 CosyVoice2 zero-shot 使用。"""
         import torchaudio  # type: ignore
+        # self._ref_audio 已在 __init__ 中经过 _resolve_safe_path 验证
         waveform, sr = torchaudio.load(self._ref_audio)
         if sr != 16000:
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)

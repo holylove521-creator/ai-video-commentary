@@ -19,6 +19,8 @@ class VRAMManager:
     CPU-only 环境下所有查询方法返回 0.0，不影响流程运行。
     """
 
+    _GB = 1024 ** 3  # bytes per gigabyte
+
     def __init__(self, device_index: int = 0) -> None:
         """初始化显存管理器。
 
@@ -39,22 +41,21 @@ class VRAMManager:
         if not self._cuda_available:
             return 0.0
         free_bytes, _ = torch.cuda.mem_get_info(self._device)
-        return free_bytes / 1024 ** 3
+        return free_bytes / self._GB
 
     def get_used_vram(self) -> float:
         """返回当前已用显存（GB）。"""
         if not self._cuda_available:
             return 0.0
-        _, total_bytes = torch.cuda.mem_get_info(self._device)
-        free_bytes, _ = torch.cuda.mem_get_info(self._device)
-        return (total_bytes - free_bytes) / 1024 ** 3
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self._device)
+        return (total_bytes - free_bytes) / self._GB
 
     def get_total_vram(self) -> float:
         """返回 GPU 总显存（GB）。"""
         if not self._cuda_available:
             return 0.0
         _, total_bytes = torch.cuda.mem_get_info(self._device)
-        return total_bytes / 1024 ** 3
+        return total_bytes / self._GB
 
     # ------------------------------------------------------------------
     # 阈值检查
