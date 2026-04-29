@@ -78,6 +78,7 @@ def process_video(
         "📹 生活 Vlog": "vlog",
         "🎬 纪录片旁白": "doc",
         "😂 吐槽搞笑": "comedy",
+        "🎥 电影解说": "movie",
     }
     style = style_map.get(style_choice, "game")
     ref_audio = ref_audio_file if ref_audio_file else None
@@ -173,6 +174,7 @@ def create_ui():
                         "📹 生活 Vlog",
                         "🎬 纪录片旁白",
                         "😂 吐槽搞笑",
+                        "🎥 电影解说",
                     ],
                     value="🎮 游戏解说",
                 )

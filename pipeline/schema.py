@@ -7,6 +7,74 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
 import json
 
+
+@dataclass
+class DialogueLine:
+    """单条对白时间轴（来自外挂 SRT 或 ASR）。"""
+    start: float
+    end: float
+    text: str
+    source: str = "srt"          # "srt" | "asr"
+    speaker: Optional[str] = None
+
+    def to_dict(self):
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d):
+        return DialogueLine(**d)
+
+
+@dataclass
+class Shot:
+    """PySceneDetect 输出的 shot（单镜头）。"""
+    shot_id: int
+    start: float
+    end: float
+    repr_frame_path: Optional[str] = None  # 代表帧 JPEG 路径
+
+    def to_dict(self):
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d):
+        return Shot(**d)
+
+
+@dataclass
+class Scene:
+    """叙事 scene = 多个 shot 聚合 + 对应对白。"""
+    scene_id: int
+    start: float
+    end: float
+    shot_ids: List[int] = field(default_factory=list)
+    repr_frame_path: Optional[str] = None
+    dialogue: List[DialogueLine] = field(default_factory=list)
+    # VL 输出（粗筛 / 精分逐步填充）
+    plot_role: Optional[str] = None        # setup|conflict|twist|climax|resolution|filler
+    importance: float = 0.0                # 0-10
+    visual_desc: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def dialogue_text(self, max_chars: int = 200) -> str:
+        """合并对白文本，超长截断（避免撑爆 VL prompt）。"""
+        joined = " ".join(d.text.strip() for d in self.dialogue if d.text)
+        if len(joined) > max_chars:
+            joined = joined[:max_chars] + "…"
+        return joined
+
+    def to_dict(self):
+        d = asdict(self)
+        d["dialogue"] = [x.to_dict() for x in self.dialogue]
+        return d
+
+    @staticmethod
+    def from_dict(d):
+        d = dict(d)
+        d["dialogue"] = [DialogueLine.from_dict(x) for x in d.get("dialogue", [])]
+        return Scene(**d)
+
+
 @dataclass
 class EventBlock:
     """

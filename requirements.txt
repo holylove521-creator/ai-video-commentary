@@ -6,11 +6,16 @@ httpx[asyncio]>=0.27.0
 # 视频处理
 opencv-python>=4.9.0
 decord>=0.6.0
-moviepy>=1.0.3
 ffmpeg-python>=0.2.0
+
+# 场景检测
+scenedetect>=0.6.3
 
 # 语音识别（用于时间戳对齐）
 faster-whisper>=1.0.0
+
+# SRT 字幕解析（可选，DialogueStage 优先用内置解析器）
+pysrt>=1.1.2
 
 # 深度学习框架（TTS / 显存管理）
 torch>=2.2.0
@@ -34,3 +39,7 @@ aiofiles>=23.2.1
 
 # 数值计算
 numpy>=1.26.0
+
+# 系统监控
+psutil>=5.9.0
+GPUtil>=1.4.0

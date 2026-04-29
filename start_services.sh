@@ -2,6 +2,10 @@
 # ============================================================
 # start_services.sh - 启动 llama.cpp VL 服务器和脚本生成服务器
 # ============================================================
+# 注意：当 config/model_config.yaml 中 phase_swap.enabled=true 时，
+# main.py 会通过 services.server_manager 自动按阶段启停 llama-server。
+# 此脚本仅用于手动调试或 phase_swap=false 的常驻模式。
+# 在 48GB 显存上同时启动 VL-32B + Script-32B + VL-7B 会显存超额。
 set -e
 
 # ---------- 颜色定义 ----------

@@ -59,7 +59,9 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
     from pipeline.stage2_scriptgen import ScriptGenerator
     from pipeline.stage3_tts import TTSEngine
     from pipeline.stage4_editing import VideoEditor
+    from pipeline.dialogue_stage import DialogueStage
     from pipeline import benchmark, media_probe, asr_stage, schema
+    from services.server_manager import ServerManager
 
     # 并发参数优先级：命令行 > 配置文件 > 默认
     video_cfg = config.get("video", {})
@@ -78,6 +80,27 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
     total_start = time.time()
     vram = VRAMManager()
     vram.log_status()
+
+    # 阶段化服务管理（VRAM 约束）
+    use_phase_swap = bool(config.get("phase_swap", {}).get("enabled", False))
+    server_mgr: ServerManager | None = None
+    if use_phase_swap:
+        server_mgr = ServerManager(
+            config, log_dir=config.get("phase_swap", {}).get("log_dir", "/tmp")
+        )
+        await server_mgr.ensure_phase("vl")
+
+    # Stage 0: 对白提取（SRT 优先 / Whisper 降级）
+    dialogue_lines = []
+    if not (args.event_json and Path(args.event_json).exists()):
+        logger.info("=" * 60)
+        logger.info("Stage 0/4 ▶ 对白提取（SRT/Whisper）")
+        t0 = time.time()
+        dlg = DialogueStage(config)
+        dialogue_lines = dlg.extract(args.input, srt_path=args.srt)
+        logger.info(
+            f"Stage 0 完成，获得 {len(dialogue_lines)} 条对白  ({time.time()-t0:.1f}s)"
+        )
 
     # 创建 LLM 客户端
     vl_client, script_client = create_clients(config)
@@ -99,7 +122,11 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
             # 传递并发参数
             stage1 = VideoUnderstanding(vl_client, config, fast_vl_client=fast_vl_client)
             stage1._max_concurrent = max_concurrent_vl
-            event_blocks = await stage1.analyze_video(args.input, fps_sample=args.fps)
+            event_blocks = await stage1.analyze_video(
+                args.input, fps_sample=args.fps, dialogue=dialogue_lines
+            )
+            # 保存 scenes供 Stage4 使用
+            scenes = list(getattr(stage1, "last_scenes", []) or [])
             logger.info(f"Stage 1 完成，识别 {len(event_blocks)} 个场景  ({time.time()-t1:.1f}s)")
             # 自动保存
             out_json = f"outputs/event_blocks_{int(time.time())}.json"
@@ -118,7 +145,26 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
             logger.info("=" * 60)
             logger.info(f"Stage 2/4 ▶ 解说脚本生成（风格: {args.style}）")
             t2 = time.time()
-            stage2 = ScriptGenerator(script_client, style=args.style, config=config)
+            # phase swap: vl → script
+            if server_mgr is not None:
+                await vl_client.close()
+                if fast_vl_client is not None and fast_vl_client is not vl_client:
+                    await fast_vl_client.close()
+                fast_vl_client = None
+                vram.force_gc()
+                await server_mgr.ensure_phase("script")
+                # 重建 script_client（vl_client 已关）
+                from utils.llm_client import LlamaCppClient
+                script_port = config["script_server"]["port"]
+                await script_client.close()
+                script_client = LlamaCppClient(f"http://localhost:{script_port}")
+            stage2 = ScriptGenerator(
+                script_client,
+                style=args.style,
+                config=config,
+                target_seconds=args.target_duration,
+                movie_name=args.movie_name,
+            )
             narration_segments = await stage2.generate(event_blocks)
             logger.info(f"Stage 2 完成，生成 {len(narration_segments)} 段脚本  ({time.time()-t2:.1f}s)")
             out_json = f"outputs/narration_segments_{int(time.time())}.json"
@@ -129,10 +175,21 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
             benchmark.benchmark.mark("after_stage2")
 
     finally:
-        await vl_client.close()
-        await script_client.close()
+        try:
+            await vl_client.close()
+        except Exception:
+            pass
+        try:
+            await script_client.close()
+        except Exception:
+            pass
         if fast_vl_client is not None and fast_vl_client is not vl_client:
-            await fast_vl_client.close()
+            try:
+                await fast_vl_client.close()
+            except Exception:
+                pass
+        if server_mgr is not None:
+            await server_mgr.ensure_phase("none")
         vram.force_gc()
 
     # Stage 3: MixSegment
@@ -145,7 +202,7 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
         logger.info("Stage 3/4 ▶ 语音合成（TTS）")
         t3 = time.time()
         stage3 = TTSEngine(config, ref_audio=args.ref_audio)
-            # 传递并发参数（如需多线程/多进程可在 synthesize_all 内实现）
+        # 传递并发参数（如需多线程/多进程可在 synthesize_all 内实现）
         stage3._max_concurrent = max_concurrent_tts
         mix_segments = stage3.synthesize_all(narration_segments)
         logger.info(f"Stage 3 完成  ({time.time()-t3:.1f}s)")
@@ -165,10 +222,13 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
     # 确保输出目录存在
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
 
+    # scenes 变量可能不存在（从 JSON 恢复时）
+    scenes_for_edit = locals().get("scenes", None)
     result_path = stage4.compose(
         video_path=args.input,
         mix_segments=mix_segments,
         output_path=args.output,
+        scenes=scenes_for_edit,
         no_subtitle=args.no_subtitle,
     )
     logger.info(f"Stage 4 完成  ({time.time()-t4:.1f}s)")
@@ -208,9 +268,21 @@ def main() -> None:
     parser.add_argument("--output", default="output.mp4", help="输出视频路径（默认 output.mp4）")
     parser.add_argument(
         "--style",
-        default="game",
-        choices=["game", "sports", "vlog", "doc", "comedy"],
-        help="解说风格（默认 game）",
+        default="movie",
+        choices=["movie", "game", "sports", "vlog", "doc", "comedy"],
+        help="解说风格（默认 movie — 谷阿莫式电影解说）",
+    )
+    parser.add_argument(
+        "--movie-name", default="该电影",
+        help="电影名称（用于脚本生成提示词）",
+    )
+    parser.add_argument(
+        "--target-duration", type=int, default=420,
+        help="目标解说总时长（秒），默认 420（约 7 分钟）",
+    )
+    parser.add_argument(
+        "--srt", default=None,
+        help="外挂 SRT 字幕路径（优先于 Whisper ASR）",
     )
     parser.add_argument(
         "--ref-audio", default=None,

@@ -67,6 +67,21 @@ vl_server_fast:
   batch_size: 512
   parallel: 8                 # 7B 模型 ~5.5GB，可跑 8 并发（48GB 显存安全）
 
+# ---- 阶段化进程管理（48GB 显存约束）----
+# Phase vl:     启动 vl_server + vl_server_fast（约 22GB + 5.5GB）
+# Phase script: 关闭 vl 进程，启动 script_server（约 22GB）
+# 由 services.server_manager.ServerManager 在运行时按 phase 切换。
+phase_swap:
+  enabled: true
+  log_dir: /tmp
+
+# ---- 字幕样式（被 movie.yaml 覆盖）----
+subtitle_style:
+  font_name: 微软雅黑
+  font_size: 42
+  primary_color: "&H00FFFFFF"
+  outline_color: "&H00000000"
+
 # ---- 路径配置 ----
 paths:
   temp_dir: /tmp/ai_video_tmp

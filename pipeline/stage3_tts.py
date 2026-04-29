@@ -50,6 +50,9 @@ class TTSEngine:
         self._model_path: str = tts_cfg.get("model_path", "models/CosyVoice2-0.5B")
         self._default_voice: str = tts_cfg.get("default_voice", "zh-cn-female-1")
         self._sample_rate: int = int(tts_cfg.get("sample_rate", 22050))
+        self._max_concurrent: int = int(tts_cfg.get("max_concurrent", 4))
+        self._max_chars_per_sentence: int = int(tts_cfg.get("max_chars_per_sentence", 30))
+        self._chapter_gap_seconds: float = float(tts_cfg.get("chapter_gap_seconds", 0.3))
         self._ref_audio: Optional[str] = (
             self._resolve_safe_path(ref_audio) if ref_audio else None
         )
@@ -70,7 +73,6 @@ class TTSEngine:
 
         Returns:
             ``True`` 表示加载成功，``False`` 表示 CosyVoice2 未安装（降级模式）。
-        self._max_concurrent: int = tts_cfg.get("max_concurrent", 4)
         """
         if self._model is not None:
             return self._cosyvoice_available
@@ -91,22 +93,6 @@ class TTSEngine:
             self._cosyvoice_available = False
 
         return self._cosyvoice_available
-
-        import concurrent.futures
-        results = [None] * len(narration_segments)
-        def synth(idx_seg):
-            idx, seg = idx_seg
-            wav_path = self.synthesize_segment(seg.text, seg.emotion, idx)
-            return MixSegment(
-                text=seg.text,
-                emotion=seg.emotion,
-                wav_path=wav_path,
-                idx=idx,
-            )
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_concurrent) as executor:
-            for r in executor.map(synth, enumerate(narration_segments)):
-                results[r.idx] = r
-        return results
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
@@ -174,25 +160,145 @@ class TTSEngine:
         return out_path
 
     def synthesize_all(self, narration_segments: list[NarrationSegment]) -> list[MixSegment]:
-        """批量合成 NarrationSegment，返回 MixSegment 列表。"""
+        """批量合成 NarrationSegment → MixSegment。
+
+        新策略：
+        - 单段文本超过 ``max_chars_per_sentence`` 时按标点切分后合成再拼接（避免
+          CosyVoice2 长句吞字）。
+        - **以 TTS 实际生成的音频时长为准**，重新计算 ``start_time/end_time``，
+          上层剪辑直接以此对齐，不再变速画面。
+        - 跨章节边界（``extra.chapter_id`` 变化）插入 ``chapter_gap_seconds`` 静音。
+        """
         results: list[MixSegment] = []
+        cursor = 0.0
+        prev_chapter: Optional[int] = None
         for i, seg in enumerate(tqdm(narration_segments, desc="语音合成")):
-            audio_path = self.synthesize_segment(
+            emotion = (seg.extra or {}).get("emotion", "neutral")
+            chapter_id = (seg.extra or {}).get("chapter_id")
+
+            # 章节边界静音
+            if (
+                prev_chapter is not None
+                and chapter_id is not None
+                and chapter_id != prev_chapter
+                and self._chapter_gap_seconds > 0
+            ):
+                cursor += self._chapter_gap_seconds
+            prev_chapter = chapter_id
+
+            audio_path = self._synthesize_long_text(
                 text=seg.text,
-                emotion=seg.extra.get("emotion", "neutral") if seg.extra else "neutral",
+                emotion=emotion,
                 segment_idx=i,
             )
+            actual_dur = self.get_audio_duration(audio_path)
+            if actual_dur <= 0:
+                actual_dur = max(1.0, len(seg.text) / 4.0)
+
+            start = round(cursor, 3)
+            end = round(cursor + actual_dur, 3)
+            cursor = end
+
             results.append(MixSegment(
-                start_time=seg.start_time if seg.start_time is not None else 0.0,
-                end_time=seg.end_time if seg.end_time is not None else 0.0,
+                start_time=start,
+                end_time=end,
                 narration_audio=audio_path,
                 subtitle_file=None,
                 video_file=None,
                 instructions=None,
-                extra={"narration": seg.to_dict()}
+                extra={
+                    "narration": seg.to_dict(),
+                    "actual_duration": actual_dur,
+                    "chapter_id": chapter_id,
+                },
             ))
-        logger.success(f"[Stage3] 全部 {len(results)} 段语音合成完成")
+        logger.success(
+            f"[Stage3] 全部 {len(results)} 段语音合成完成，总时长 {cursor:.1f}s"
+        )
         return results
+
+    def _synthesize_long_text(
+        self,
+        text: str,
+        emotion: str,
+        segment_idx: int,
+    ) -> str:
+        """长文本按标点切分逐句合成，再用 ffmpeg concat 拼一段 wav。"""
+        text = (text or "").strip()
+        if not text:
+            out_path = str(self._output_dir / f"seg_{segment_idx:04d}.wav")
+            self._write_silence(out_path, duration=0.5)
+            return out_path
+
+        sentences = self._split_sentences(text, self._max_chars_per_sentence)
+        if len(sentences) == 1:
+            return self.synthesize_segment(text, emotion, segment_idx)
+
+        sub_paths: list[str] = []
+        for j, sent in enumerate(sentences):
+            sub_idx = segment_idx * 1000 + j
+            sub_paths.append(self.synthesize_segment(sent, emotion, sub_idx))
+
+        out_path = str(self._output_dir / f"seg_{segment_idx:04d}.wav")
+        self._concat_wavs(sub_paths, out_path)
+        return out_path
+
+    @staticmethod
+    def _split_sentences(text: str, max_len: int) -> list[str]:
+        """按中文标点切句，超长再按 max_len 硬切。"""
+        import re as _re
+        # 在标点后切，但保留标点
+        parts = _re.split(r"(?<=[。！？!?；;])", text)
+        out: list[str] = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            while len(p) > max_len:
+                # 在 max_len 范围内尽量在标点处切
+                cut = max_len
+                for sep in "，,、 ":
+                    pos = p.rfind(sep, 0, max_len)
+                    if pos >= max_len // 2:
+                        cut = pos + 1
+                        break
+                out.append(p[:cut].strip())
+                p = p[cut:].strip()
+            if p:
+                out.append(p)
+        return out or [text]
+
+    def _concat_wavs(self, wav_paths: list[str], out_path: str) -> None:
+        """用 ffmpeg concat demuxer 拼接 wav。"""
+        import subprocess
+        list_file = Path(out_path).with_suffix(".list.txt")
+        list_file.write_text(
+            "\n".join(f"file '{Path(p).resolve()}'" for p in wav_paths),
+            encoding="utf-8",
+        )
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_file),
+            "-c", "copy", out_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError:
+            # 编码不一致时强制重新编码
+            cmd2 = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(list_file),
+                "-ar", str(self._sample_rate), "-ac", "1",
+                out_path,
+            ]
+            subprocess.run(cmd2, check=True)
+        finally:
+            try:
+                list_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def get_audio_duration(self, audio_path: str) -> float:
         """获取 WAV 音频时长（秒）。

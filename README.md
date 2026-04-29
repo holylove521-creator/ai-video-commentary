@@ -1,6 +1,48 @@
 # 🎬 AI 智能视频解说生成系统
 
-基于 **llama.cpp** 推理框架的本地全链路 AI 智能剪辑与解说视频生成系统，支持游戏、体育、Vlog、纪录片、搞笑吐槽等多种风格，全程本地推理，无需联网。
+> **当前定位：电影解说（谷阿莫风格）**
+> 输入一部 4K/2h 电影 + 可选外挂 SRT，输出一段 5–10 分钟（默认 7 分钟）的中文电影解说视频。
+> 目标：单部电影端到端处理 ≤ 45 分钟（48GB 显存，160 TOPS）。
+>
+> 流水线主要组件：
+> - **Stage 0**：SRT 优先 / faster-whisper 兜底的对白提取（`pipeline/dialogue_stage.py`）
+> - **Stage 1**：ffmpeg NVDEC 缩略图 + PySceneDetect 镜头切分 → VL-7B 粗筛 → VL-32B 精分（注入对白）
+> - **Stage 2**：3-stage 脚本生成（D1 抽情节 → D2 章节大纲 → D3 逐章写稿，链式 prev_anchor）
+> - **Stage 3**：CosyVoice2 语音合成（按标点切句 + 章节静音 + **以 TTS 实际时长**对齐输出时间轴）
+> - **Stage 4**：纯 ffmpeg 流水线（流拷贝切片 + concat + 一次性 nvenc 编码 + ASS 字幕烧录）
+>
+> 服务编排：`services/server_manager.py` 在 `vl` / `script` 两阶段间切换 llama-server 进程，避免 48GB 显存超额。
+>
+> 旧的 game/sports/vlog/doc/comedy 风格仍可通过 `--style` 选用，但不再是主线。
+
+基于 **llama.cpp** 推理框架的本地全链路 AI 智能剪辑与解说视频生成系统，全程本地推理，无需联网。
+
+---
+
+## 快速开始（电影解说）
+
+```bash
+# 1) 编译 llama.cpp 与下载模型
+bash scripts/build_llamacpp.sh
+bash scripts/download_models.sh
+
+# 2) 安装 Python 依赖
+pip install -r requirements.txt
+
+# 3) 一键运行（带 SRT）
+python main.py \
+    --input /path/to/movie.mkv \
+    --srt /path/to/movie.zh.srt \
+    --movie-name "盗梦空间" \
+    --target-duration 420 \
+    --output outputs/movie_commentary.mp4
+
+# 不带 SRT（自动 Whisper）
+python main.py --input movie.mp4 --movie-name "片名" --output out.mp4
+```
+
+`config/model_config.yaml` 中 `phase_swap.enabled=true` 时，main.py 会自动按阶段启停 llama-server，无需手动运行 `start_services.sh`。
+
 
 ---
 
