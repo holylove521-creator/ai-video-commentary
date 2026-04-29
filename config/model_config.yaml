@@ -2,41 +2,45 @@
 # AI 智能视频解说生成系统 - 全局模型与服务配置
 # ============================================================
 
-# ---- 视觉语言模型服务（Stage 1：视频理解）----
+# llama.cpp 可执行文件路径（已在本地编译好，直接填写路径）
+llamacpp:
+  server_bin: /usr/local/bin/llama-server   # ← 改为你本地 llama-server 的实际路径
+
+# 视觉理解服务（Qwen2.5-VL）
 vl_server:
-  model_path: models/Qwen2.5-VL-32B-Instruct-Q5_K_M.gguf
-  mmproj_path: models/mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf
-  host: 127.0.0.1
-  port: 8080
+  model_path: /path/to/your/models/Qwen2.5-VL-32B-Instruct-Q5_K_M.gguf   # ← 改为实际路径
+  mmproj_path: /path/to/your/models/mmproj-Qwen2.5-VL-32B-Instruct-f16.gguf  # ← 改为实际路径
+  host: 0.0.0.0
+  port: 8001
   n_gpu_layers: 999       # 全部层卸载 GPU
   ctx_size: 8192          # 上下文长度
   batch_size: 512
   parallel: 2             # 并发请求数
 
-# ---- 文本大语言模型服务（Stage 2：脚本生成）----
+# 脚本生成服务（Qwen2.5-32B）
 script_server:
-  model_path: models/Qwen2.5-32B-Instruct-Q5_K_M.gguf
-  host: 127.0.0.1
-  port: 8081
+  model_path: /path/to/your/models/Qwen2.5-32B-Instruct-Q5_K_M.gguf   # ← 改为实际路径
+  host: 0.0.0.0
+  port: 8002
   n_gpu_layers: 999
   ctx_size: 16384         # 更大上下文以容纳长脚本
   batch_size: 1024
   parallel: 4
   mlock: true             # 锁定内存，防止换页
 
-# ---- TTS 语音合成（Stage 3）----
+# TTS 模型
 tts:
-  model_path: models/CosyVoice2-0.5B
-  default_voice: zh-cn-female-1
+  model_path: /path/to/your/models/CosyVoice2-0.5B   # ← 改为实际路径
+  default_voice: 中文女
   sample_rate: 22050
 
-# ---- 语音识别（字幕时间戳对齐）----
+# Whisper 语音识别
 whisper:
   model_size: large-v3
   device: cuda
   compute_type: float16
 
-# ---- 视频处理参数 ----
+# 视频处理参数
 video:
   fps_sample: 1.0         # 抽帧频率（帧/秒）
   frame_quality: 85       # JPEG 质量（0-100）
@@ -44,8 +48,8 @@ video:
   output_codec: h264_nvenc  # NVIDIA 硬件编码
   output_crf: 23          # 编码质量（越低质量越高）
 
-# ---- 路径配置 ----
+# 路径配置
 paths:
-  temp_dir: /tmp/ai_video_tmp
-  output_dir: outputs
-  models_dir: models
+  temp_dir: /tmp/ai_video_commentary
+  output_dir: ./output
+  models_dir: /path/to/your/models   # ← 改为实际模型目录

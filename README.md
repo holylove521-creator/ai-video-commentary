@@ -56,79 +56,47 @@
 
 ---
 
-## 安装步骤
+## ⚙️ 快速配置本地路径
 
-### 1. 编译 llama.cpp
+编辑 `config/model_config.yaml`，将以下字段改为你本地的实际路径：
 
+| 字段 | 说明 | 示例 |
+|------|------|------|
+| `llamacpp.server_bin` | llama-server 可执行文件路径 | `/home/user/llama.cpp/build/bin/llama-server` |
+| `vl_server.model_path` | 视觉理解模型 GGUF 路径 | `/data/models/Qwen2.5-VL-32B-Q5_K_M.gguf` |
+| `vl_server.mmproj_path` | 视觉投影矩阵路径 | `/data/models/mmproj-Qwen2.5-VL-32B-f16.gguf` |
+| `script_server.model_path` | 脚本生成模型 GGUF 路径 | `/data/models/Qwen2.5-32B-Q5_K_M.gguf` |
+| `tts.model_path` | CosyVoice2 模型目录 | `/data/models/CosyVoice2-0.5B` |
+
+配置完成后直接执行：
 ```bash
-bash scripts/build_llamacpp.sh
-```
-
-脚本会自动：
-- 检测 CUDA 环境
-- 克隆 llama.cpp 仓库
-- 使用 `GGML_CUDA=ON` 编译
-- 自动检测 GPU 架构（sm_80/sm_86/sm_89/sm_90）
-- 验证 `llama-server` 二进制文件
-
-### 2. 下载模型
-
-```bash
-bash scripts/download_models.sh
-```
-
-将自动下载：
-- `Qwen2.5-VL-32B-Instruct-Q5_K_M.gguf`（视觉理解）+ mmproj
-- `Qwen2.5-32B-Instruct-Q5_K_M.gguf`（脚本生成）
-- `CosyVoice2-0.5B`（语音合成）
-
-### 3. 安装 Python 依赖
-
-```bash
-pip install -r requirements.txt
+bash start_services.sh   # 启动推理服务
+python main.py --input your_video.mp4 --output result.mp4 --style game
 ```
 
 ---
 
-## 快速开始
-
-### 启动后台服务
+## 🚀 快速开始
 
 ```bash
+# 1. 克隆仓库
+git clone https://github.com/holylove521-creator/ai-video-commentary.git
+cd ai-video-commentary
+
+# 2. 安装 Python 依赖
+pip install -r requirements.txt
+
+# 3. 配置本地模型路径（编辑此文件）
+nano config/model_config.yaml
+
+# 4. 启动推理服务
 bash start_services.sh
-```
 
-两个 llama-server 实例将在后台启动：
-- **VL Server**（端口 8080）：多模态视觉理解
-- **Script Server**（端口 8081）：文本脚本生成
+# 5. 运行（命令行）
+python main.py --input your_video.mp4 --output result.mp4 --style game
 
-### 生成解说视频
-
-```bash
-# 基本用法
-python main.py --input my_video.mp4 --output result.mp4 --style game
-
-# 指定参考声音（声音克隆）
-python main.py --input my_video.mp4 --output result.mp4 --style sports --ref-audio my_voice.wav
-
-# 不生成字幕
-python main.py --input my_video.mp4 --style vlog --no-subtitle
-
-# 提高抽帧密度（适合快节奏内容）
-python main.py --input my_video.mp4 --fps 2.0 --style comedy
-```
-
-### 启动 Web 界面
-
-```bash
+# 或启动 Web UI
 python web_ui/app.py
-# 浏览器访问 http://localhost:7860
-```
-
-### 停止后台服务
-
-```bash
-bash stop_services.sh
 ```
 
 ---
@@ -138,14 +106,17 @@ bash stop_services.sh
 所有配置集中在 `config/model_config.yaml`：
 
 ```yaml
+llamacpp:
+  server_bin: /usr/local/bin/llama-server  # llama-server 可执行文件路径
+
 vl_server:
-  model_path: models/Qwen2.5-VL-32B-Q5_K_M.gguf  # 视觉模型路径
-  port: 8080
+  model_path: /path/to/your/models/Qwen2.5-VL-32B-Q5_K_M.gguf  # 视觉模型路径
+  port: 8001
   n_gpu_layers: 999   # 全部卸载 GPU
 
 script_server:
-  model_path: models/Qwen2.5-32B-Q5_K_M.gguf  # 文本模型路径
-  port: 8081
+  model_path: /path/to/your/models/Qwen2.5-32B-Q5_K_M.gguf  # 文本模型路径
+  port: 8002
   n_gpu_layers: 999
 
 video:
@@ -211,7 +182,7 @@ ai-video-commentary/
 A: 修改 `config/model_config.yaml`，将模型替换为更小量化版本（如 Q4_K_M），或改用 7B/14B 模型。
 
 **Q: llama-server 启动失败？**
-A: 检查模型文件路径是否正确，运行 `bash scripts/build_llamacpp.sh` 重新编译，确保 CUDA 环境正常（`nvcc --version`）。
+A: 检查 `config/model_config.yaml` 中 `llamacpp.server_bin` 路径是否正确，确保 CUDA 环境正常（`nvcc --version`）。
 
 **Q: CosyVoice2 未安装时语音合成怎么办？**
 A: Stage 3 会优雅降级，生成静音音轨并提示安装路径。参考 [CosyVoice 官方文档](https://github.com/FunAudioLLM/CosyVoice) 安装。
