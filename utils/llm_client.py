@@ -121,6 +121,34 @@ class LlamaCppClient:
         ]
         return await self.chat(messages, temperature=temperature, max_tokens=max_tokens)
 
+    async def vision_chat_b64(
+        self,
+        prompt: str,
+        image_b64: str,
+        temperature: float = 0.1,
+        max_tokens: int = 512,
+    ) -> str:
+        """与 vision_chat 相同，但直接接受 base64 字符串（避免重复读文件）。"""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_b64}"
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        return await self.chat(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
     async def health_check(self) -> bool:
         """检查服务是否就绪。
 
@@ -156,3 +184,15 @@ def create_clients(config: dict) -> tuple["LlamaCppClient", "LlamaCppClient"]:
         f"Script 客户端 → :{script_port}"
     )
     return vl_client, script_client
+
+
+def create_fast_client(config: dict) -> "LlamaCppClient | None":
+    """创建 VL-7B 快速粗筛客户端。
+
+    若配置中没有 vl_server_fast 节，则返回 None（调用方降级为 32B）。
+    """
+    fast_cfg = config.get("vl_server_fast")
+    if fast_cfg is None:
+        logger.warning("配置中无 vl_server_fast，粗筛将使用 vl_server（32B）")
+        return None
+    return LlamaCppClient(f"http://localhost:{fast_cfg['port']}")
