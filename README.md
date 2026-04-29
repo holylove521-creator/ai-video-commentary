@@ -179,6 +179,7 @@ video:
 | `vlog` | vlog.yaml | 日常 Vlog、旅行视频 |
 | `doc` | doc.yaml | 纪录片、科普内容 |
 | `comedy` | comedy.yaml | 搞笑视频、吐槽剪辑 |
+| `movie` | movie.yaml | 电影解说博主，深沉有磁性，适合电影/剧情类内容 |
 
 自定义风格：复制任意模板 YAML，修改 `system_prompt` 即可。
 
@@ -200,7 +201,8 @@ ai-video-commentary/
 │       ├── sports.yaml
 │       ├── vlog.yaml
 │       ├── doc.yaml
-│       └── comedy.yaml
+│       ├── comedy.yaml
+│       └── movie.yaml
 ├── pipeline/
 │   ├── stage1_understanding.py  # 视频理解（VL 模型）
 │   ├── stage2_scriptgen.py      # 脚本生成（LLM）
