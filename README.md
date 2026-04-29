@@ -56,36 +56,51 @@
 
 ---
 
-## 安装步骤
+## 📦 安装
 
-### 1. 编译 llama.cpp
-
-```bash
-bash scripts/build_llamacpp.sh
-```
-
-脚本会自动：
-- 检测 CUDA 环境
-- 克隆 llama.cpp 仓库
-- 使用 `GGML_CUDA=ON` 编译
-- 自动检测 GPU 架构（sm_80/sm_86/sm_89/sm_90）
-- 验证 `llama-server` 二进制文件
-
-### 2. 下载模型
+### 1. 克隆仓库
 
 ```bash
-bash scripts/download_models.sh
+git clone https://github.com/holylove521-creator/ai-video-commentary.git
+cd ai-video-commentary
 ```
 
-将自动下载：
-- `Qwen2.5-VL-32B-Instruct-Q5_K_M.gguf`（视觉理解）+ mmproj
-- `Qwen2.5-32B-Instruct-Q5_K_M.gguf`（脚本生成）
-- `CosyVoice2-0.5B`（语音合成）
-
-### 3. 安装 Python 依赖
+### 2. 安装 Python 依赖
 
 ```bash
 pip install -r requirements.txt
+```
+
+> CosyVoice2 需单独安装，参考：https://github.com/FunAudioLLM/CosyVoice
+
+### 3. 配置本地模型路径
+
+编辑 `config/model_config.yaml`，将所有 `/path/to/...` 替换为你本地的实际路径：
+
+| 配置字段 | 说明 |
+|----------|------|
+| `llamacpp.server_bin` | llama-server 可执行文件绝对路径 |
+| `vl_server.model_path` | Qwen2.5-VL GGUF 模型文件路径 |
+| `vl_server.mmproj_path` | mmproj 投影文件路径 |
+| `script_server.model_path` | Qwen2.5-32B GGUF 模型文件路径 |
+| `tts.model_path` | CosyVoice2-0.5B 模型目录路径 |
+
+### 4. 启动推理服务
+
+```bash
+bash start_services.sh
+```
+
+启动脚本会自动检查所有路径是否正确，并等待服务健康检查通过。
+
+### 5. 运行
+
+```bash
+# 命令行方式
+python main.py --input your_video.mp4 --output result.mp4 --style game
+
+# Web UI 方式
+python web_ui/app.py
 ```
 
 ---
@@ -99,8 +114,8 @@ bash start_services.sh
 ```
 
 两个 llama-server 实例将在后台启动：
-- **VL Server**（端口 8080）：多模态视觉理解
-- **Script Server**（端口 8081）：文本脚本生成
+- **VL Server**（端口 8001）：多模态视觉理解
+- **Script Server**（端口 8002）：文本脚本生成
 
 ### 生成解说视频
 
@@ -199,8 +214,8 @@ ai-video-commentary/
 ├── web_ui/
 │   └── app.py                 # Gradio Web 界面
 └── scripts/
-    ├── build_llamacpp.sh      # 编译 llama.cpp（CUDA）
-    └── download_models.sh     # 下载所需模型
+    ├── build_llamacpp.sh      # 占位脚本（llama.cpp 已在本地就绪）
+    └── download_models.sh     # 占位脚本（模型已在本地就绪）
 ```
 
 ---
@@ -211,7 +226,7 @@ ai-video-commentary/
 A: 修改 `config/model_config.yaml`，将模型替换为更小量化版本（如 Q4_K_M），或改用 7B/14B 模型。
 
 **Q: llama-server 启动失败？**
-A: 检查模型文件路径是否正确，运行 `bash scripts/build_llamacpp.sh` 重新编译，确保 CUDA 环境正常（`nvcc --version`）。
+A: 检查 `config/model_config.yaml` 中的 `llamacpp.server_bin` 路径是否指向正确的 llama-server 可执行文件，并确认模型路径也已正确配置。
 
 **Q: CosyVoice2 未安装时语音合成怎么办？**
 A: Stage 3 会优雅降级，生成静音音轨并提示安装路径。参考 [CosyVoice 官方文档](https://github.com/FunAudioLLM/CosyVoice) 安装。
