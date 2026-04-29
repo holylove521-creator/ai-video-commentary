@@ -59,6 +59,21 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
     from pipeline.stage2_scriptgen import ScriptGenerator
     from pipeline.stage3_tts import TTSEngine
     from pipeline.stage4_editing import VideoEditor
+    from pipeline import benchmark, media_probe, asr_stage, schema
+
+    # 并发参数优先级：命令行 > 配置文件 > 默认
+    video_cfg = config.get("video", {})
+    max_concurrent_vl = args.max_concurrent_vl if args.max_concurrent_vl is not None else video_cfg.get("max_concurrent_frames", 8)
+    max_concurrent_tts = args.max_concurrent_tts if args.max_concurrent_tts is not None else config.get("tts", {}).get("max_concurrent", 4)
+    import psutil
+    import GPUtil
+    logger.info(f"[并发] VL并发: {max_concurrent_vl} | TTS并发: {max_concurrent_tts}")
+    # 输出系统资源
+    cpu_count = psutil.cpu_count(logical=True)
+    gpus = GPUtil.getGPUs()
+    for gpu in gpus:
+        logger.info(f"[GPU] {gpu.name} | 显存: {gpu.memoryFree:.1f}MB / {gpu.memoryTotal:.1f}MB | 利用率: {gpu.load*100:.1f}%")
+    logger.info(f"[CPU] 逻辑核数: {cpu_count} | 当前负载: {psutil.getloadavg()}")
 
     total_start = time.time()
     vram = VRAMManager()
@@ -68,30 +83,50 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
     vl_client, script_client = create_clients(config)
     fast_vl_client = create_fast_client(config)
 
+    import os
+    from pipeline import schema
+    # 断点续跑与中间结果自动保存/加载
     try:
-        # ----------------------------------------------------------
-        # Stage 1: 视频理解
-        # ----------------------------------------------------------
-        logger.info("=" * 60)
-        logger.info("Stage 1/4 ▶ 视频理解与场景分析")
-        t1 = time.time()
-        stage1 = VideoUnderstanding(vl_client, config, fast_vl_client=fast_vl_client)
-        scenes = await stage1.analyze_video(
-            args.input, fps_sample=args.fps
-        )
-        logger.info(f"Stage 1 完成，识别 {len(scenes)} 个场景  ({time.time()-t1:.1f}s)")
-        vram.log_status()
+        # Stage 1: EventBlock
+        if args.event_json and os.path.exists(args.event_json):
+            logger.info(f"[Batch5] 加载 EventBlock JSON: {args.event_json}")
+            with open(args.event_json, encoding="utf-8") as f:
+                event_blocks = schema.schema_list_from_json(schema.EventBlock, f.read())
+        else:
+            logger.info("=" * 60)
+            logger.info("Stage 1/4 ▶ 视频理解与场景分析")
+            t1 = time.time()
+            # 传递并发参数
+            stage1 = VideoUnderstanding(vl_client, config, fast_vl_client=fast_vl_client)
+            stage1._max_concurrent = max_concurrent_vl
+            event_blocks = await stage1.analyze_video(args.input, fps_sample=args.fps)
+            logger.info(f"Stage 1 完成，识别 {len(event_blocks)} 个场景  ({time.time()-t1:.1f}s)")
+            # 自动保存
+            out_json = f"outputs/event_blocks_{int(time.time())}.json"
+            with open(out_json, "w", encoding="utf-8") as f:
+                f.write(schema.schema_list_to_json(event_blocks))
+            logger.info(f"[Batch5] EventBlock 已保存: {out_json}")
+        if getattr(args, "benchmark", False):
+            benchmark.benchmark.mark("after_stage1")
 
-        # ----------------------------------------------------------
-        # Stage 2: 脚本生成
-        # ----------------------------------------------------------
-        logger.info("=" * 60)
-        logger.info(f"Stage 2/4 ▶ 解说脚本生成（风格: {args.style}）")
-        t2 = time.time()
-        stage2 = ScriptGenerator(script_client, style=args.style, config=config)
-        script = await stage2.generate(scenes)
-        logger.info(f"Stage 2 完成，生成 {len(script)} 段脚本  ({time.time()-t2:.1f}s)")
-        vram.log_status()
+        # Stage 2: NarrationSegment
+        if args.script_json and os.path.exists(args.script_json):
+            logger.info(f"[Batch5] 加载 NarrationSegment JSON: {args.script_json}")
+            with open(args.script_json, encoding="utf-8") as f:
+                narration_segments = schema.schema_list_from_json(schema.NarrationSegment, f.read())
+        else:
+            logger.info("=" * 60)
+            logger.info(f"Stage 2/4 ▶ 解说脚本生成（风格: {args.style}）")
+            t2 = time.time()
+            stage2 = ScriptGenerator(script_client, style=args.style, config=config)
+            narration_segments = await stage2.generate(event_blocks)
+            logger.info(f"Stage 2 完成，生成 {len(narration_segments)} 段脚本  ({time.time()-t2:.1f}s)")
+            out_json = f"outputs/narration_segments_{int(time.time())}.json"
+            with open(out_json, "w", encoding="utf-8") as f:
+                f.write(schema.schema_list_to_json(narration_segments))
+            logger.info(f"[Batch5] NarrationSegment 已保存: {out_json}")
+        if getattr(args, "benchmark", False):
+            benchmark.benchmark.mark("after_stage2")
 
     finally:
         await vl_client.close()
@@ -100,20 +135,28 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
             await fast_vl_client.close()
         vram.force_gc()
 
-    # ----------------------------------------------------------
-    # Stage 3: 语音合成
-    # ----------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("Stage 3/4 ▶ 语音合成（TTS）")
-    t3 = time.time()
-    stage3 = TTSEngine(config, ref_audio=args.ref_audio)
-    script_with_audio = stage3.synthesize_all(script)
-    logger.info(f"Stage 3 完成  ({time.time()-t3:.1f}s)")
-    vram.log_status()
+    # Stage 3: MixSegment
+    if args.mix_json and os.path.exists(args.mix_json):
+        logger.info(f"[Batch5] 加载 MixSegment JSON: {args.mix_json}")
+        with open(args.mix_json, encoding="utf-8") as f:
+            mix_segments = schema.schema_list_from_json(schema.MixSegment, f.read())
+    else:
+        logger.info("=" * 60)
+        logger.info("Stage 3/4 ▶ 语音合成（TTS）")
+        t3 = time.time()
+        stage3 = TTSEngine(config, ref_audio=args.ref_audio)
+            # 传递并发参数（如需多线程/多进程可在 synthesize_all 内实现）
+        stage3._max_concurrent = max_concurrent_tts
+        mix_segments = stage3.synthesize_all(narration_segments)
+        logger.info(f"Stage 3 完成  ({time.time()-t3:.1f}s)")
+        out_json = f"outputs/mix_segments_{int(time.time())}.json"
+        with open(out_json, "w", encoding="utf-8") as f:
+            f.write(schema.schema_list_to_json(mix_segments))
+        logger.info(f"[Batch5] MixSegment 已保存: {out_json}")
+    if getattr(args, "benchmark", False):
+        benchmark.benchmark.mark("after_stage3")
 
-    # ----------------------------------------------------------
     # Stage 4: 剪辑合成
-    # ----------------------------------------------------------
     logger.info("=" * 60)
     logger.info("Stage 4/4 ▶ 智能剪辑与视频合成")
     t4 = time.time()
@@ -124,11 +167,13 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
 
     result_path = stage4.compose(
         video_path=args.input,
-        script_with_audio=script_with_audio,
+        mix_segments=mix_segments,
         output_path=args.output,
         no_subtitle=args.no_subtitle,
     )
     logger.info(f"Stage 4 完成  ({time.time()-t4:.1f}s)")
+    if getattr(args, "benchmark", False):
+        benchmark.benchmark.mark("after_stage4")
 
     # ----------------------------------------------------------
     # 总结
@@ -183,6 +228,37 @@ def main() -> None:
         "--config", default="config/model_config.yaml",
         help="配置文件路径（默认 config/model_config.yaml）",
     )
+    parser.add_argument(
+        "--benchmark", action="store_true",
+        help="输出各阶段耗时统计（可选）",
+    )
+    parser.add_argument(
+        "--probe", action="store_true",
+        help="仅探测输入视频基础信息并退出",
+    )
+    parser.add_argument(
+        "--asr-audio", default=None,
+        help="仅对指定音频文件做ASR转写并退出（可选）",
+    )
+    parser.add_argument(
+        "--resume-stage", default=None, choices=[None, "event", "script", "mix"],
+        help="从指定阶段/中间结果文件恢复（event/script/mix）",
+    )
+    parser.add_argument(
+        "--event-json", default=None, help="EventBlock JSON 路径（跳过 Stage1）"
+    )
+    parser.add_argument(
+        "--script-json", default=None, help="NarrationSegment JSON 路径（跳过 Stage1/2）"
+    )
+    parser.add_argument(
+        "--mix-json", default=None, help="MixSegment JSON 路径（跳过 Stage1/2/3）"
+    )
+    parser.add_argument(
+        "--max-concurrent-vl", type=int, default=None, help="VL推理最大并发数（覆盖配置文件）"
+    )
+    parser.add_argument(
+        "--max-concurrent-tts", type=int, default=None, help="TTS合成最大并发数（覆盖配置文件）"
+    )
 
     args = parser.parse_args()
 
@@ -196,6 +272,19 @@ def main() -> None:
     except FileNotFoundError as exc:
         logger.error(str(exc))
         raise SystemExit(1) from exc
+
+    # Batch 2: probe/media/asr 分支
+    if args.probe:
+        from pipeline import media_probe
+        info = media_probe.probe_video(args.input)
+        print("[Probe] 视频信息:", info)
+        return
+    if args.asr_audio:
+        from pipeline import asr_stage
+        asr = asr_stage.ASRStage()
+        result = asr.transcribe(args.asr_audio)
+        print("[ASR] 识别结果:", result)
+        return
 
     asyncio.run(run_pipeline(args, config))
 

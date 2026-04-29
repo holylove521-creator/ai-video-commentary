@@ -31,6 +31,7 @@ from tqdm.asyncio import tqdm as async_tqdm
 from utils.frame_extractor import FrameExtractor
 from utils.llm_client import LlamaCppClient
 from utils.scene_detector import SceneDetector
+from pipeline.schema import EventBlock
 
 
 # ------------------------------------------------------------------
@@ -97,7 +98,8 @@ class VideoUnderstanding:
         self._max_concurrent_deep: int = video_cfg.get("max_concurrent_deep", 2)
 
         self._scene_detection_enabled: bool = scene_cfg.get("enabled", True)
-        self._scene_threshold: float = scene_cfg.get("threshold", 0.4)
+        self._max_concurrent: int = video_cfg.get("max_concurrent_frames", 8)
+        self._max_concurrent: int = video_cfg.get("max_concurrent", 8)
         self._min_scene_gap: float = scene_cfg.get("min_scene_gap", 2.0)
         self._top_score_threshold: int = scene_cfg.get("top_score_threshold", 7)
 
@@ -118,12 +120,9 @@ class VideoUnderstanding:
         self,
         video_path: str,
         fps_sample: Optional[float] = None,
-    ) -> list[dict]:
-        """端到端分析视频，返回场景列表。
-
-        若 scene_detection.enabled=true，走两阶段流水线；
-        否则退化为原始逐帧分析（兼容旧行为）。
-        """
+        max_concurrent: int = None,
+    ) -> list[EventBlock]:
+        """端到端分析视频，返回 EventBlock 列表。"""
         if self._scene_detection_enabled:
             return await self._analyze_two_phase(video_path)
         else:
@@ -133,7 +132,7 @@ class VideoUnderstanding:
     # 两阶段流水线
     # ------------------------------------------------------------------
 
-    async def _analyze_two_phase(self, video_path: str) -> list[dict]:
+    async def _analyze_two_phase(self, video_path: str) -> list[EventBlock]:
         """两阶段流水线：场景检测 → 粗筛 → 精分。"""
         import time
         t0 = time.time()
@@ -212,7 +211,7 @@ class VideoUnderstanding:
         self,
         video_path: str,
         fps_sample: Optional[float] = None,
-    ) -> list[dict]:
+    ) -> list[EventBlock]:
         fps = fps_sample if fps_sample is not None else self._fps_sample
         logger.info(f"[Stage1] 传统模式: fps_sample={fps}")
         frames = self._extractor.extract(
@@ -323,12 +322,12 @@ class VideoUnderstanding:
     # 场景合并
     # ------------------------------------------------------------------
 
-    def _merge_scenes(self, analyzed_frames: list[dict]) -> list[dict]:
-        """将连续帧合并为场景（时间间隔≤3s 且情绪相同）。"""
+    def _merge_scenes(self, analyzed_frames: list[dict]) -> list[EventBlock]:
+        """将连续帧合并为 EventBlock（时间间隔≤3s 且情绪相同）。"""
         if not analyzed_frames:
             return []
 
-        scenes: list[dict] = []
+        scenes: list[EventBlock] = []
         current: list[dict] = [analyzed_frames[0]]
 
         for frame in analyzed_frames[1:]:
@@ -344,22 +343,26 @@ class VideoUnderstanding:
         return scenes
 
     @staticmethod
-    def _build_scene(frames: list[dict]) -> dict:
+    def _build_scene(frames: list[dict]) -> EventBlock:
         scores = [f.get("highlight_score", 0) for f in frames]
         avg = sum(scores) / len(scores) if scores else 0.0
         rep = frames[len(frames) // 2]
-        return {
-            "start": frames[0]["timestamp"],
-            "end": frames[-1]["timestamp"],
-            "scene_desc": rep.get("scene_desc", ""),
-            "main_subject": rep.get("main_subject", ""),
-            "action": rep.get("action", ""),
-            "emotion": rep.get("emotion", "neutral"),
-            "avg_highlight": round(avg, 2),
-            "has_cut_point": any(f.get("cut_point", False) for f in frames),
-            "frame_count": len(frames),
-            "frames": frames,
-        }
+        # 组装 EventBlock
+        return EventBlock(
+            start_time=frames[0]["timestamp"],
+            end_time=frames[-1]["timestamp"],
+            type=rep.get("action", "scene"),
+            summary=rep.get("scene_desc", ""),
+            characters=[rep.get("main_subject", "")] if rep.get("main_subject") else [],
+            asr_transcript=None,
+            visual_tags=[rep.get("emotion", "neutral")],
+            extra={
+                "avg_highlight": round(avg, 2),
+                "has_cut_point": any(f.get("cut_point", False) for f in frames),
+                "frame_count": len(frames),
+                "frames": frames,
+            }
+        )
 
 
 # ------------------------------------------------------------------
@@ -386,8 +389,8 @@ if __name__ == "__main__":
             scenes = await stage1.analyze_video(sys.argv[1])
             for i, s in enumerate(scenes, 1):
                 print(
-                    f"场景{i:03d} [{s['start']:.1f}s-{s['end']:.1f}s]  "
-                    f"亮点={s['avg_highlight']}  {s['scene_desc'][:50]}"
+                    f"场景{i:03d} [{s.start_time:.1f}s-{s.end_time:.1f}s]  "
+                    f"亮点={s.extra.get('avg_highlight', 0)}  {s.summary[:50]}"
                 )
         finally:
             await vl_client.close()

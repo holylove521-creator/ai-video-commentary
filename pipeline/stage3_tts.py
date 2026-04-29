@@ -18,6 +18,7 @@ from typing import Optional
 
 from loguru import logger
 from tqdm import tqdm
+from pipeline.schema import NarrationSegment, MixSegment
 
 
 # 情感标签 → CosyVoice2 instructed speech 前缀映射
@@ -69,6 +70,7 @@ class TTSEngine:
 
         Returns:
             ``True`` 表示加载成功，``False`` 表示 CosyVoice2 未安装（降级模式）。
+        self._max_concurrent: int = tts_cfg.get("max_concurrent", 4)
         """
         if self._model is not None:
             return self._cosyvoice_available
@@ -90,6 +92,21 @@ class TTSEngine:
 
         return self._cosyvoice_available
 
+        import concurrent.futures
+        results = [None] * len(narration_segments)
+        def synth(idx_seg):
+            idx, seg = idx_seg
+            wav_path = self.synthesize_segment(seg.text, seg.emotion, idx)
+            return MixSegment(
+                text=seg.text,
+                emotion=seg.emotion,
+                wav_path=wav_path,
+                idx=idx,
+            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_concurrent) as executor:
+            for r in executor.map(synth, enumerate(narration_segments)):
+                results[r.idx] = r
+        return results
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
@@ -156,23 +173,24 @@ class TTSEngine:
 
         return out_path
 
-    def synthesize_all(self, script: list[dict]) -> list[dict]:
-        """批量合成全部脚本段落。
-
-        Args:
-            script: Stage 2 输出的脚本列表。
-
-        Returns:
-            在原脚本基础上增加 ``audio_path`` 字段的列表。
-        """
-        results: list[dict] = []
-        for i, seg in enumerate(tqdm(script, desc="语音合成")):
+    def synthesize_all(self, narration_segments: list[NarrationSegment]) -> list[MixSegment]:
+        """批量合成 NarrationSegment，返回 MixSegment 列表。"""
+        results: list[MixSegment] = []
+        for i, seg in enumerate(tqdm(narration_segments, desc="语音合成")):
             audio_path = self.synthesize_segment(
-                text=seg.get("text", ""),
-                emotion=seg.get("emotion", "neutral"),
+                text=seg.text,
+                emotion=seg.extra.get("emotion", "neutral") if seg.extra else "neutral",
                 segment_idx=i,
             )
-            results.append({**seg, "audio_path": audio_path})
+            results.append(MixSegment(
+                start_time=seg.start_time if seg.start_time is not None else 0.0,
+                end_time=seg.end_time if seg.end_time is not None else 0.0,
+                narration_audio=audio_path,
+                subtitle_file=None,
+                video_file=None,
+                instructions=None,
+                extra={"narration": seg.to_dict()}
+            ))
         logger.success(f"[Stage3] 全部 {len(results)} 段语音合成完成")
         return results
 
@@ -254,16 +272,17 @@ if __name__ == "__main__":
     ref = sys.argv[1] if len(sys.argv) > 1 else None
     engine = TTSEngine(config, ref_audio=ref)
 
+    from pipeline.schema import NarrationSegment
     sample_script = [
-        {"start": 0.0, "end": 5.0, "text": "欢迎来到今天的游戏直播！", "emotion": "excited"},
-        {"start": 5.0, "end": 10.0, "text": "我们即将迎来精彩的对决。", "emotion": "tense"},
-        {"start": 10.0, "end": 15.0, "text": "这波操作真的太秀了！", "emotion": "funny"},
+        NarrationSegment(text="欢迎来到今天的游戏直播！", event_block_index=0, speaker="旁白", style=None, start_time=0.0, end_time=5.0, extra={"emotion": "excited"}),
+        NarrationSegment(text="我们即将迎来精彩的对决。", event_block_index=1, speaker="旁白", style=None, start_time=5.0, end_time=10.0, extra={"emotion": "tense"}),
+        NarrationSegment(text="这波操作真的太秀了！", event_block_index=2, speaker="旁白", style=None, start_time=10.0, end_time=15.0, extra={"emotion": "funny"}),
     ]
 
     results = engine.synthesize_all(sample_script)
     for seg in results:
-        dur = engine.get_audio_duration(seg["audio_path"])
+        dur = engine.get_audio_duration(seg.narration_audio)
         print(
-            f"[{seg['start']:.1f}s - {seg['end']:.1f}s] "
-            f"音频: {seg['audio_path']}  时长: {dur:.2f}s"
+            f"[{seg.start_time:.1f}s - {seg.end_time:.1f}s] "
+            f"音频: {seg.narration_audio}  时长: {dur:.2f}s"
         )

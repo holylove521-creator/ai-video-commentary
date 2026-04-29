@@ -29,6 +29,7 @@ tts:
   model_path: models/CosyVoice2-0.5B
   default_voice: zh-cn-female-1
   sample_rate: 22050
+  max_concurrent: 4   # 最大并发数，充分利用多核/多卡
 
 # ---- 语音识别（字幕时间戳对齐）----
 whisper:
@@ -44,6 +45,7 @@ video:
   deep_resize: [1920, 1080]   # Phase 2 精分分辨率（1080p）
   max_concurrent_frames: 8    # Phase 1 VL-7B 并发数
   max_concurrent_deep: 2      # Phase 2 VL-32B 并发数
+  max_concurrent: 8           # 总体最大并发（可被 CLI 覆盖）
   output_codec: h264_nvenc    # NVIDIA 硬件编码
   output_crf: 23              # 编码质量（越低质量越高）
 

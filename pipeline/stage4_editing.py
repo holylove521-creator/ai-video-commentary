@@ -16,6 +16,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from utils.subtitle_renderer import SubtitleRenderer
+from pipeline.schema import MixSegment
 
 
 class VideoEditor:
@@ -46,21 +47,11 @@ class VideoEditor:
     def compose(
         self,
         video_path: str,
-        script_with_audio: list[dict],
+        mix_segments: list[MixSegment],
         output_path: str,
         no_subtitle: bool = False,
     ) -> str:
-        """将视频片段与 TTS 音频合成最终视频。
-
-        Args:
-            video_path:         原始视频路径。
-            script_with_audio:  Stage 3 输出的脚本列表（含 ``audio_path`` 字段）。
-            output_path:        输出视频路径。
-            no_subtitle:        ``True`` 时跳过字幕生成与烧录。
-
-        Returns:
-            最终输出视频路径。
-        """
+        """将视频片段与 TTS 音频合成最终视频（输入为 MixSegment）。"""
         try:
             from moviepy.editor import (  # type: ignore
                 VideoFileClip,
@@ -76,9 +67,9 @@ class VideoEditor:
         source = VideoFileClip(video_path)
         clips = []
 
-        for i, seg in enumerate(tqdm(script_with_audio, desc="剪辑合成")):
-            start = float(seg.get("start", 0))
-            end = float(seg.get("end", start + 3))
+        for i, seg in enumerate(tqdm(mix_segments, desc="剪辑合成")):
+            start = float(seg.start_time)
+            end = float(seg.end_time)
             end = min(end, source.duration)
             if end <= start:
                 logger.warning(f"[Stage4] 段落 {i} 时间无效，跳过")
@@ -88,7 +79,7 @@ class VideoEditor:
             clip = source.subclip(start, end)
 
             # 加载 TTS 音频
-            audio_path = seg.get("audio_path", "")
+            audio_path = seg.narration_audio or ""
             if audio_path and Path(audio_path).exists():
                 audio = AudioFileClip(audio_path)
                 # 计算变速比，将视频片段与音频对齐
@@ -130,7 +121,7 @@ class VideoEditor:
         # 字幕处理
         if not no_subtitle:
             output_path = self._attach_subtitles(
-                script_with_audio, temp_output, output_path
+                mix_segments, temp_output, output_path
             )
         else:
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -144,19 +135,21 @@ class VideoEditor:
     # ------------------------------------------------------------------
 
     def generate_subtitles(
-        self, script: list[dict], output_ass: Optional[str] = None
+        self, mix_segments: list[MixSegment], output_ass: Optional[str] = None
     ) -> str:
-        """根据脚本生成 ASS 字幕文件。
-
-        Args:
-            script:     脚本列表（含 start/end/text 字段）。
-            output_ass: 输出路径，默认为工作目录下 subtitles.ass。
-
-        Returns:
-            ASS 文件路径。
-        """
+        """根据 MixSegment 生成 ASS 字幕文件。"""
         if output_ass is None:
             output_ass = str(self._work_dir / "subtitles.ass")
+        # 提取字幕信息
+        script = []
+        for seg in mix_segments:
+            narration = seg.extra.get("narration") if seg.extra else None
+            text = narration["text"] if isinstance(narration, dict) else ""
+            script.append({
+                "start": seg.start_time,
+                "end": seg.end_time,
+                "text": text,
+            })
         return self._subtitle_renderer.generate_ass(script, output_ass)
 
     def burn_subtitles(
@@ -181,13 +174,13 @@ class VideoEditor:
 
     def _attach_subtitles(
         self,
-        script: list[dict],
+        mix_segments: list[MixSegment],
         video_path: str,
         output_path: str,
     ) -> str:
         """生成字幕并烧录到视频，返回最终输出路径。"""
         try:
-            ass_path = self.generate_subtitles(script)
+            ass_path = self.generate_subtitles(mix_segments)
             self.burn_subtitles(video_path, ass_path, output_path)
         except subprocess.CalledProcessError as exc:
             logger.error(
@@ -217,20 +210,21 @@ if __name__ == "__main__":
         config = yaml.safe_load(f)
 
     from pipeline.stage3_tts import TTSEngine
+    from pipeline.schema import NarrationSegment
     engine = TTSEngine(config)
 
-    # 示例脚本
+    # 示例脚本（NarrationSegment）
     sample_script = [
-        {"start": 0.0, "end": 5.0, "text": "欢迎观看今天的视频！", "emotion": "excited"},
-        {"start": 5.0, "end": 10.0, "text": "精彩内容即将呈现。", "emotion": "calm"},
+        NarrationSegment(text="欢迎观看今天的视频！", event_block_index=0, speaker="旁白", style=None, start_time=0.0, end_time=5.0, extra={"emotion": "excited"}),
+        NarrationSegment(text="精彩内容即将呈现。", event_block_index=1, speaker="旁白", style=None, start_time=5.0, end_time=10.0, extra={"emotion": "calm"}),
     ]
-    with_audio = engine.synthesize_all(sample_script)
+    mix_segments = engine.synthesize_all(sample_script)
 
     editor = VideoEditor(config)
     no_sub = "--no-subtitle" in sys.argv
     result = editor.compose(
         video_path=sys.argv[1],
-        script_with_audio=with_audio,
+        mix_segments=mix_segments,
         output_path=sys.argv[2],
         no_subtitle=no_sub,
     )

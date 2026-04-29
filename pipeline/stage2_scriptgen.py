@@ -21,6 +21,7 @@ import yaml
 from loguru import logger
 
 from utils.llm_client import LlamaCppClient
+from pipeline.schema import EventBlock, ChapterPlan, NarrationSegment
 
 
 # ------------------------------------------------------------------
@@ -73,20 +74,8 @@ class ScriptGenerator:
     # 公开接口
     # ------------------------------------------------------------------
 
-    async def generate(self, scenes: list[dict]) -> list[dict]:
-        """根据场景列表生成解说脚本。
-
-        Args:
-            scenes: Stage 1 输出的场景列表。
-
-        Returns:
-            脚本列表，每项格式::
-
-                {"start": float, "end": float, "text": str, "emotion": str}
-
-        Raises:
-            RuntimeError: LLM 调用失败或返回无效 JSON。
-        """
+    async def generate(self, scenes: list[EventBlock]) -> list[NarrationSegment]:
+        """根据 EventBlock 列表生成 NarrationSegment 列表。"""
         if not scenes:
             logger.warning("[Stage2] 场景列表为空，返回空脚本")
             return []
@@ -107,9 +96,9 @@ class ScriptGenerator:
         logger.info(f"[Stage2] 开始生成脚本（风格: {self._style}，共 {len(scenes)} 个场景）")
         raw = await self._client.chat(messages, temperature=0.7, max_tokens=4096)
         script = self._parse_script(raw)
-        script = self._validate_script(script, scenes)
-        logger.success(f"[Stage2] 脚本生成完成，共 {len(script)} 段")
-        return script
+        narration_segments = self._validate_script(script, scenes)
+        logger.success(f"[Stage2] 脚本生成完成，共 {len(narration_segments)} 段")
+        return narration_segments
 
     # ------------------------------------------------------------------
     # 内部辅助
@@ -128,13 +117,20 @@ class ScriptGenerator:
             return yaml.safe_load(f)
 
     @staticmethod
-    def _slim_scenes(scenes: list[dict]) -> list[dict]:
-        """精简场景数据，仅保留 LLM 需要的字段以减少 token 消耗。"""
-        keep = {"start", "end", "scene_desc", "action", "emotion", "avg_highlight"}
-        return [
-            {k: v for k, v in scene.items() if k in keep}
-            for scene in scenes
-        ]
+    def _slim_scenes(scenes: list[EventBlock]) -> list[dict]:
+        """精简 EventBlock，仅保留 LLM 需要的字段。"""
+        out = []
+        for eb in scenes:
+            d = {
+                "start": eb.start_time,
+                "end": eb.end_time,
+                "scene_desc": eb.summary,
+                "action": eb.type,
+                "emotion": eb.visual_tags[0] if eb.visual_tags else "neutral",
+                "avg_highlight": eb.extra.get("avg_highlight", 0) if eb.extra else 0,
+            }
+            out.append(d)
+        return out
 
     @staticmethod
     def _parse_script(raw: str) -> list[dict]:
@@ -174,35 +170,25 @@ class ScriptGenerator:
 
     @staticmethod
     def _validate_script(
-        script: list[dict], scenes: list[dict]
-    ) -> list[dict]:
-        """校验并修正脚本时间戳合理性。
-
-        - 确保每段时长 ≥ 1 秒
-        - 确保 start < end
-        - 若脚本为空，按场景生成占位脚本
-
-        Args:
-            script: 原始脚本列表。
-            scenes: 场景列表（用于生成占位脚本）。
-
-        Returns:
-            修正后的脚本列表。
-        """
+        script: list[dict], scenes: list[EventBlock]
+    ) -> list[NarrationSegment]:
+        """校验并修正脚本时间戳合理性，返回 NarrationSegment 列表。"""
+        validated: list[NarrationSegment] = []
         if not script and scenes:
             logger.warning("[Stage2] 脚本为空，生成占位脚本")
-            return [
-                {
-                    "start": s["start"],
-                    "end": s["end"],
-                    "text": s.get("scene_desc", ""),
-                    "emotion": s.get("emotion", "neutral"),
-                }
-                for s in scenes
-            ]
+            for idx, s in enumerate(scenes):
+                validated.append(NarrationSegment(
+                    text=s.summary,
+                    event_block_index=idx,
+                    speaker="旁白",
+                    style=None,
+                    start_time=s.start_time,
+                    end_time=s.end_time,
+                    extra={"emotion": s.visual_tags[0] if s.visual_tags else "neutral"}
+                ))
+            return validated
 
-        validated: list[dict] = []
-        for seg in script:
+        for idx, seg in enumerate(script):
             try:
                 start = float(seg.get("start", 0))
                 end = float(seg.get("end", start + 3))
@@ -210,17 +196,17 @@ class ScriptGenerator:
                     end = start + 3.0
                 if end - start < 1.0:
                     end = start + 1.0
-                validated.append(
-                    {
-                        "start": round(start, 3),
-                        "end": round(end, 3),
-                        "text": str(seg.get("text", "")),
-                        "emotion": str(seg.get("emotion", "neutral")),
-                    }
-                )
+                validated.append(NarrationSegment(
+                    text=str(seg.get("text", "")),
+                    event_block_index=idx,
+                    speaker="旁白",
+                    style=None,
+                    start_time=round(start, 3),
+                    end_time=round(end, 3),
+                    extra={"emotion": str(seg.get("emotion", "neutral"))}
+                ))
             except (TypeError, ValueError) as exc:
                 logger.warning(f"[Stage2] 跳过无效脚本段: {seg}  原因: {exc}")
-
         return validated
 
 
@@ -231,21 +217,18 @@ class ScriptGenerator:
 if __name__ == "__main__":
     import sys
 
+    from pipeline.schema import EventBlock
     async def _test():
-        # 加载示例场景
+        # 加载示例 EventBlock
         sample_scenes = [
-            {
-                "start": 0.0, "end": 5.0,
-                "scene_desc": "玩家进入地图，四处张望",
-                "action": "移动", "emotion": "calm",
-                "avg_highlight": 3.0,
-            },
-            {
-                "start": 5.0, "end": 12.0,
-                "scene_desc": "突然遭遇敌方，激烈交火",
-                "action": "战斗", "emotion": "excited",
-                "avg_highlight": 8.5,
-            },
+            EventBlock(
+                start_time=0.0, end_time=5.0, type="移动", summary="玩家进入地图，四处张望",
+                characters=["玩家"], asr_transcript=None, visual_tags=["calm"], extra={"avg_highlight": 3.0}
+            ),
+            EventBlock(
+                start_time=5.0, end_time=12.0, type="战斗", summary="突然遭遇敌方，激烈交火",
+                characters=["玩家", "敌方"], asr_transcript=None, visual_tags=["excited"], extra={"avg_highlight": 8.5}
+            ),
         ]
         style = sys.argv[1] if len(sys.argv) > 1 else "game"
 
@@ -258,11 +241,11 @@ if __name__ == "__main__":
 
         try:
             gen = ScriptGenerator(script_client, style=style, config=config)
-            script = await gen.generate(sample_scenes)
-            for seg in script:
+            narration_segments = await gen.generate(sample_scenes)
+            for seg in narration_segments:
                 print(
-                    f"[{seg['start']:.1f}s - {seg['end']:.1f}s] "
-                    f"({seg['emotion']}) {seg['text']}"
+                    f"[{seg.start_time:.1f}s - {seg.end_time:.1f}s] "
+                    f"({seg.extra.get('emotion', 'neutral')}) {seg.text}"
                 )
         finally:
             await script_client.close()

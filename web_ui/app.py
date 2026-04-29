@@ -62,6 +62,8 @@ def process_video(
     ref_audio_file,
     fps_sample: float,
     enable_subtitle: bool,
+    # Batch 2: 支持可选 benchmark、probe、asr
+    extra=None,
 ):
     """Gradio 处理函数：执行完整流水线，返回 (日志, 输出视频路径)。"""
     import gradio as gr
@@ -90,45 +92,48 @@ def process_video(
     try:
         config = _load_config()
 
-        # 动态导入（避免在 import 时报错）
         from utils.llm_client import create_clients
         from utils.vram_manager import VRAMManager
         from pipeline.stage1_understanding import VideoUnderstanding
         from pipeline.stage2_scriptgen import ScriptGenerator
         from pipeline.stage3_tts import TTSEngine
         from pipeline.stage4_editing import VideoEditor
+        from pipeline import benchmark, media_probe, asr_stage, schema
 
+        # 全链路 schema 化
         async def _pipeline():
             vl_client, script_client = create_clients(config)
             try:
                 stage1 = VideoUnderstanding(vl_client, config)
-                scenes = await stage1.analyze_video(video_file, fps_sample=fps_sample)
+                event_blocks = await stage1.analyze_video(video_file, fps_sample=fps_sample)
 
                 stage2 = ScriptGenerator(script_client, style=style, config=config)
-                script = await stage2.generate(scenes)
+                narration_segments = await stage2.generate(event_blocks)
             finally:
                 await vl_client.close()
                 await script_client.close()
                 VRAMManager().force_gc()
 
             stage3 = TTSEngine(config, ref_audio=ref_audio)
-            script_with_audio = stage3.synthesize_all(script)
+            mix_segments = stage3.synthesize_all(narration_segments)
 
             stage4 = VideoEditor(config)
-            return stage4.compose(
+            result_path = stage4.compose(
                 video_path=video_file,
-                script_with_audio=script_with_audio,
+                mix_segments=mix_segments,
                 output_path=output_path,
                 no_subtitle=not enable_subtitle,
             )
+            return event_blocks, narration_segments, mix_segments, result_path
 
-        result = asyncio.run(_pipeline())
+        event_blocks, narration_segments, mix_segments, result = asyncio.run(_pipeline())
         logger.success(f"处理完成 → {result}")
-        return _get_log_text(), result
+        # 返回日志、视频、event_blocks、narration_segments、mix_segments
+        return _get_log_text(), result, schema.schema_to_json(event_blocks), schema.schema_to_json(narration_segments), schema.schema_to_json(mix_segments)
 
     except Exception as exc:
         logger.error(f"处理失败: {exc}")
-        return _get_log_text(), None
+        return _get_log_text(), None, "", "", ""
 
 
 # ------------------------------------------------------------------
@@ -182,6 +187,14 @@ def create_ui():
                     label="生成字幕", value=True
                 )
                 run_btn = gr.Button("🚀 开始生成", variant="primary", size="lg")
+                probe_btn = gr.Button("🔍 仅探测视频信息", variant="secondary")
+                asr_audio_input = gr.Audio(label="仅ASR音频（可选）", type="filepath", sources=["upload"])
+                asr_btn = gr.Button("🗣️ 仅ASR转写", variant="secondary")
+                benchmark_toggle = gr.Checkbox(label="输出阶段耗时统计", value=False)
+                # 导出按钮
+                export_event_btn = gr.Button("导出场景JSON", variant="secondary")
+                export_script_btn = gr.Button("导出脚本JSON", variant="secondary")
+                export_mix_btn = gr.Button("导出混剪JSON", variant="secondary")
 
         gr.Markdown("### 📊 处理日志")
         log_output = gr.Textbox(
@@ -198,6 +211,11 @@ def create_ui():
         # 刷新日志（每 2 秒）
         demo.load(fn=_get_log_text, outputs=log_output, every=2)
 
+        # 结果缓存
+        event_json = gr.Textbox(label="场景JSON", visible=False)
+        script_json = gr.Textbox(label="脚本JSON", visible=False)
+        mix_json = gr.Textbox(label="混剪JSON", visible=False)
+
         run_btn.click(
             fn=process_video,
             inputs=[
@@ -207,7 +225,25 @@ def create_ui():
                 fps_slider,
                 subtitle_toggle,
             ],
+            outputs=[log_output, video_output, event_json, script_json, mix_json],
+        )
+        export_event_btn.click(lambda x: x, inputs=[event_json], outputs=[event_json])
+        export_script_btn.click(lambda x: x, inputs=[script_json], outputs=[script_json])
+        export_mix_btn.click(lambda x: x, inputs=[mix_json], outputs=[mix_json])
+        probe_btn.click(
+            lambda video, *_: process_video._extra_args.update({"probe": True}) or process_video(video, style_dropdown.value, ref_audio_input.value, fps_slider.value, subtitle_toggle.value),
+            inputs=[video_input, style_dropdown, ref_audio_input, fps_slider, subtitle_toggle],
             outputs=[log_output, video_output],
+        )
+        asr_btn.click(
+            lambda _, __, ___, ____, _____, asr_audio: process_video._extra_args.update({"asr_audio": asr_audio}) or process_video(None, style_dropdown.value, ref_audio_input.value, fps_slider.value, subtitle_toggle.value),
+            inputs=[video_input, style_dropdown, ref_audio_input, fps_slider, subtitle_toggle, asr_audio_input],
+            outputs=[log_output, video_output],
+        )
+        benchmark_toggle.change(
+            lambda val: process_video._extra_args.update({"benchmark": val}),
+            inputs=[benchmark_toggle],
+            outputs=[],
         )
 
     return demo
