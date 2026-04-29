@@ -15,12 +15,15 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import yaml
 from loguru import logger
 
 from utils.llm_client import LlamaCppClient
+
+if TYPE_CHECKING:
+    from pipeline.narrative_analyzer import NarrativeAnalyzer
 
 
 # ------------------------------------------------------------------
@@ -53,9 +56,10 @@ class ScriptGenerator:
     """基于 LLM 的解说脚本生成器。
 
     Args:
-        script_client: 连接脚本生成 llama-server 的异步客户端。
-        style:         解说风格名称（game/sports/vlog/doc/comedy）。
-        config:        全局配置字典。
+        script_client:      连接脚本生成 llama-server 的异步客户端。
+        style:              解说风格名称（game/sports/vlog/doc/comedy）。
+        config:             全局配置字典。
+        narrative_analyzer: 可选的叙事结构分析器，用于连贯性优先剪辑。
     """
 
     def __init__(
@@ -63,11 +67,13 @@ class ScriptGenerator:
         script_client: LlamaCppClient,
         style: str = "game",
         config: Optional[dict] = None,
+        narrative_analyzer: Optional["NarrativeAnalyzer"] = None,
     ) -> None:
         self._client = script_client
         self._style = style
         self._config = config or {}
         self._style_cfg = self._load_style(style)
+        self._narrative_analyzer = narrative_analyzer
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -111,6 +117,54 @@ class ScriptGenerator:
         logger.success(f"[Stage2] 脚本生成完成，共 {len(script)} 段")
         return script
 
+    async def generate_with_coherence(
+        self,
+        scenes: list[dict],
+        narrative_analyzer: "NarrativeAnalyzer",
+        target_duration: float = 0.0,
+    ) -> tuple[list[dict], list[dict], dict]:
+        """连贯性优先的完整脚本生成流程。
+
+        Args:
+            scenes:             Stage 1 输出的场景列表。
+            narrative_analyzer: 叙事结构分析器实例。
+            target_duration:    目标视频时长（秒），0 表示保留所有必要场景。
+
+        Returns:
+            ``(selected_scenes, enriched_script, coherence_score)`` 三元组：
+
+            - ``selected_scenes``: 连贯性优先筛选后的场景列表。
+            - ``enriched_script``: 注入过渡解说后的脚本列表。
+            - ``coherence_score``: 连贯性评分字典。
+        """
+        if not scenes:
+            logger.warning("[Stage2] 场景列表为空，跳过连贯性流程")
+            return [], [], {"total_score": 0.0, "issues": []}
+
+        # 1. 叙事结构分析
+        logger.info("[Stage2] 叙事结构分析中…")
+        narrative = await narrative_analyzer.analyze_narrative(scenes)
+
+        # 2. 连贯性优先场景筛选
+        # Use inf when no duration limit is set so all necessary scenes are kept.
+        max_duration = target_duration if target_duration > 0 else float("inf")
+        selected_scenes = narrative_analyzer.select_scenes_by_narrative(
+            scenes, narrative, max_duration
+        )
+
+        # 3. 生成解说脚本（使用原有 generate()）
+        script = await self.generate(selected_scenes)
+
+        # 4. 注入过渡解说
+        enriched_script = await narrative_analyzer.inject_transitions(script)
+
+        # 5. 连贯性评分
+        coherence_score = await narrative_analyzer.coherence_check(enriched_script)
+        total = coherence_score.get("total_score", 0.0)
+        logger.info(f"[Stage2] 连贯性评分: {total:.1f} / 10.0")
+
+        return selected_scenes, enriched_script, coherence_score
+
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
@@ -130,7 +184,7 @@ class ScriptGenerator:
     @staticmethod
     def _slim_scenes(scenes: list[dict]) -> list[dict]:
         """精简场景数据，仅保留 LLM 需要的字段以减少 token 消耗。"""
-        keep = {"start", "end", "scene_desc", "action", "emotion", "avg_highlight_score"}
+        keep = {"start", "end", "scene_desc", "action", "emotion", "avg_highlight"}
         return [
             {k: v for k, v in scene.items() if k in keep}
             for scene in scenes
@@ -238,13 +292,13 @@ if __name__ == "__main__":
                 "start": 0.0, "end": 5.0,
                 "scene_desc": "玩家进入地图，四处张望",
                 "action": "移动", "emotion": "calm",
-                "avg_highlight_score": 3.0,
+                "avg_highlight": 3.0,
             },
             {
                 "start": 5.0, "end": 12.0,
                 "scene_desc": "突然遭遇敌方，激烈交火",
                 "action": "战斗", "emotion": "excited",
-                "avg_highlight_score": 8.5,
+                "avg_highlight": 8.5,
             },
         ]
         style = sys.argv[1] if len(sys.argv) > 1 else "game"

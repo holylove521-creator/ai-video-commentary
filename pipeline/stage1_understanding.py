@@ -1,32 +1,53 @@
 """
-Stage 1: 视频理解与场景分析
+Stage 1: 视频理解与场景分析（优化版 - 两阶段流水线）
 
-使用 llama.cpp 驱动的多模态视觉语言模型（Qwen2.5-VL）逐帧分析视频，
-识别场景内容、主体动作、情绪氛围与高光分，最终合并为连续场景列表。
+耗时目标：4K 2小时电影 ≤ 30 分钟
 
 流程:
-    1. FrameExtractor 按指定 fps 抽取帧图片
-    2. asyncio.Semaphore 控制并发，批量调用 VL 模型
-    3. 解析 JSON 响应，容错处理
-    4. 将连续帧合并为场景，计算平均高光分
+    Phase 0 - 场景变化检测（CPU, ~2min）
+        SceneDetector 基于直方图差异，从全量帧中提取关键帧
+        典型 2h 电影：7200帧 → ~300 关键帧（削减 96%）
+
+    Phase 1 - 快速粗筛（VL-7B, 720p, 并发8, ~5min）
+        轻量 Prompt，只输出 highlight_score / emotion / cut_point
+        筛出 highlight_score >= threshold 的高光场景
+
+    Phase 2 - 精准深析（VL-32B, 1080p, 并发2, ~8min）
+        对高光场景生成完整的场景描述，供 Stage 2 脚本生成使用
+
+总计：~15-25 分钟（目标 ≤ 30 分钟）
 """
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 from typing import Optional
 
+import cv2
 from loguru import logger
 from tqdm.asyncio import tqdm as async_tqdm
 
 from utils.frame_extractor import FrameExtractor
 from utils.llm_client import LlamaCppClient
+from utils.scene_detector import SceneDetector
 
 
 # ------------------------------------------------------------------
-# 分析提示词
+# Prompts
 # ------------------------------------------------------------------
 
+# Phase 1：轻量粗筛 Prompt（输出极少 token，速度优先）
+FAST_ANALYSIS_PROMPT = """\
+分析这张视频截图，仅返回 JSON，不要其他文字：
+{
+  "highlight_score": <0-10整数，10最精彩>,
+  "emotion": "excited|calm|serious|funny|tense|neutral",
+  "cut_point": <true|false>
+}
+"""
+
+# Phase 2：完整深析 Prompt（质量优先）
 SCENE_ANALYSIS_PROMPT = """\
 请分析这张视频截图，以 JSON 格式返回以下字段（仅返回 JSON，不要其他文字）：
 
@@ -41,79 +62,252 @@ SCENE_ANALYSIS_PROMPT = """\
 """
 
 
+# ------------------------------------------------------------------
+# 主类
+# ------------------------------------------------------------------
+
 class VideoUnderstanding:
-    """视频逐帧理解与场景分析器。
+    """两阶段视频理解与场景分析器。
 
     Args:
-        vl_client:  连接 VL llama-server 的异步客户端。
-        config:     全局配置字典（从 model_config.yaml 读取）。
+        vl_client:       VL-32B 精分客户端。
+        config:          全局配置字典。
+        fast_vl_client:  VL-7B 粗筛客户端（可选，不传则退化为单阶段 32B）。
     """
 
-    def __init__(self, vl_client: LlamaCppClient, config: dict) -> None:
+    def __init__(
+        self,
+        vl_client: LlamaCppClient,
+        config: dict,
+        fast_vl_client: Optional[LlamaCppClient] = None,
+    ) -> None:
         self._client = vl_client
+        self._fast_client = fast_vl_client or vl_client
         self._config = config
+
         video_cfg = config.get("video", {})
+        scene_cfg = config.get("scene_detection", {})
+        paths_cfg = config.get("paths", {})
+
         self._fps_sample: float = video_cfg.get("fps_sample", 1.0)
         self._frame_quality: int = video_cfg.get("frame_quality", 85)
-        self._max_concurrent: int = video_cfg.get("max_concurrent_frames", 4)
-        temp_dir = config.get("paths", {}).get("temp_dir", "/tmp/ai_video_tmp")
-        self._extractor = FrameExtractor(temp_dir=f"{temp_dir}/frames")
+        self._fast_resize: tuple[int, int] = tuple(video_cfg.get("fast_resize", [1280, 720]))
+        self._deep_resize: tuple[int, int] = tuple(video_cfg.get("deep_resize", [1920, 1080]))
+        self._max_concurrent: int = video_cfg.get("max_concurrent_frames", 8)
+        self._max_concurrent_deep: int = video_cfg.get("max_concurrent_deep", 2)
+
+        self._scene_detection_enabled: bool = scene_cfg.get("enabled", True)
+        self._scene_threshold: float = scene_cfg.get("threshold", 0.4)
+        self._min_scene_gap: float = scene_cfg.get("min_scene_gap", 2.0)
+        self._top_score_threshold: int = scene_cfg.get("top_score_threshold", 7)
+
+        temp_dir = paths_cfg.get("temp_dir", "/tmp/ai_video_tmp")
+        self._temp_frames_dir = f"{temp_dir}/frames"
+
+        self._extractor = FrameExtractor(temp_dir=self._temp_frames_dir)
+        self._detector = SceneDetector(
+            threshold=self._scene_threshold,
+            min_scene_gap=self._min_scene_gap,
+        )
 
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
 
-    def extract_frames(
+    async def analyze_video(
         self,
         video_path: str,
         fps_sample: Optional[float] = None,
     ) -> list[dict]:
-        """抽取视频帧。
+        """端到端分析视频，返回场景列表。
 
-        Args:
-            video_path: 视频文件路径。
-            fps_sample: 覆盖配置中的抽帧频率（可选）。
-
-        Returns:
-            帧信息列表，参见 :class:`~utils.frame_extractor.FrameExtractor`。
+        若 scene_detection.enabled=true，走两阶段流水线；
+        否则退化为原始逐帧分析（兼容旧行为）。
         """
-        fps = fps_sample if fps_sample is not None else self._fps_sample
-        logger.info(f"[Stage1] 开始抽帧: {video_path}  fps_sample={fps}")
-        return self._extractor.extract(
-            video_path, fps_sample=fps, quality=self._frame_quality
+        if self._scene_detection_enabled:
+            return await self._analyze_two_phase(video_path)
+        else:
+            return await self._analyze_legacy(video_path, fps_sample)
+
+    # ------------------------------------------------------------------
+    # 两阶段流水线
+    # ------------------------------------------------------------------
+
+    async def _analyze_two_phase(self, video_path: str) -> list[dict]:
+        """两阶段流水线：场景检测 → 粗筛 → 精分。"""
+        import time
+        t0 = time.time()
+
+        # ── Phase 0: 场景变化检测（CPU）──
+        logger.info("[Stage1] Phase 0: 场景变化检测...")
+        keyframes = self._detector.detect_keyframes(
+            video_path,
+            temp_dir=self._temp_frames_dir,
+            jpeg_quality=self._frame_quality,
+        )
+        if not keyframes:
+            logger.warning("[Stage1] 未检测到关键帧，返回空场景列表")
+            return []
+        logger.info(f"[Stage1] Phase 0 完成: {len(keyframes)} 帧  "
+                    f"耗时 {time.time()-t0:.1f}s")
+
+        # ── Phase 1: VL-7B 快速粗筛（720p）──
+        t1 = time.time()
+        logger.info(f"[Stage1] Phase 1: VL-7B 粗筛 {len(keyframes)} 帧 "
+                    f"(并发={self._max_concurrent})...")
+        fast_results = await self._batch_analyze(
+            frames=keyframes,
+            client=self._fast_client,
+            prompt=FAST_ANALYSIS_PROMPT,
+            max_tokens=64,
+            semaphore_count=self._max_concurrent,
+            resize=self._fast_resize,
+            desc="粗筛",
+        )
+        logger.info(f"[Stage1] Phase 1 完成  耗时 {time.time()-t1:.1f}s")
+
+        # ── Phase 2: VL-32B 精分高光场景（1080p）──
+        t2 = time.time()
+        top_frames = [
+            f for f in fast_results
+            if f.get("highlight_score", 0) >= self._top_score_threshold
+        ]
+        logger.info(
+            f"[Stage1] Phase 2: VL-32B 精分 {len(top_frames)} 帧 "
+            f"(highlight≥{self._top_score_threshold}, 并发={self._max_concurrent_deep})..."
         )
 
-    async def analyze_frame(self, frame: dict) -> dict:
-        """分析单帧图片，返回场景分析结果。
-
-        Args:
-            frame: 帧信息字典 ``{"frame_idx", "timestamp", "path"}``。
-
-        Returns:
-            合并了原始帧信息和 VL 分析结果的字典。
-            若解析失败，返回默认值（highlight_score=0, cut_point=False）。
-        """
-        try:
-            raw = await self._client.vision_chat(
+        deep_map: dict[int, dict] = {}
+        if top_frames:
+            deep_results = await self._batch_analyze(
+                frames=top_frames,
+                client=self._client,
                 prompt=SCENE_ANALYSIS_PROMPT,
-                image_path=frame["path"],
-                temperature=0.1,
                 max_tokens=256,
+                semaphore_count=self._max_concurrent_deep,
+                resize=self._deep_resize,
+                desc="精分",
             )
-            # 容错：先尝试直接解析，再提取第一个完整 JSON 对象（从第一个 { 到最后一个 }）
+            deep_map = {f["frame_idx"]: f for f in deep_results}
+
+        # 用精分结果覆盖粗筛结果
+        merged = [deep_map.get(f["frame_idx"], f) for f in fast_results]
+        merged.sort(key=lambda x: x["frame_idx"])
+
+        logger.info(f"[Stage1] Phase 2 完成  耗时 {time.time()-t2:.1f}s")
+
+        scenes = self._merge_scenes(merged)
+        total = time.time() - t0
+        logger.success(
+            f"[Stage1] 全部完成  场景数={len(scenes)}  "
+            f"总耗时={total/60:.1f}min"
+        )
+        return scenes
+
+    # ------------------------------------------------------------------
+    # 兼容旧版逐帧分析（scene_detection.enabled=false 时使用）
+    # ------------------------------------------------------------------
+
+    async def _analyze_legacy(
+        self,
+        video_path: str,
+        fps_sample: Optional[float] = None,
+    ) -> list[dict]:
+        fps = fps_sample if fps_sample is not None else self._fps_sample
+        logger.info(f"[Stage1] 传统模式: fps_sample={fps}")
+        frames = self._extractor.extract(
+            video_path, fps_sample=fps, quality=self._frame_quality
+        )
+        if not frames:
+            return []
+        results = await self._batch_analyze(
+            frames=frames,
+            client=self._client,
+            prompt=SCENE_ANALYSIS_PROMPT,
+            max_tokens=256,
+            semaphore_count=self._max_concurrent,
+            resize=self._deep_resize,
+            desc="帧分析",
+        )
+        results.sort(key=lambda x: x["frame_idx"])
+        return self._merge_scenes(results)
+
+    # ------------------------------------------------------------------
+    # 通用批量推理
+    # ------------------------------------------------------------------
+
+    async def _batch_analyze(
+        self,
+        frames: list[dict],
+        client: LlamaCppClient,
+        prompt: str,
+        max_tokens: int,
+        semaphore_count: int,
+        resize: tuple[int, int],
+        desc: str = "分析",
+    ) -> list[dict]:
+        """并发分析帧列表。"""
+        sem = asyncio.Semaphore(semaphore_count)
+
+        async def _analyze_one(frame: dict) -> dict:
+            async with sem:
+                return await self._analyze_frame(
+                    frame, client, prompt, max_tokens, resize
+                )
+
+        tasks = [_analyze_one(f) for f in frames]
+        results: list[dict] = []
+        for coro in async_tqdm.as_completed(tasks, desc=desc, total=len(tasks)):
+            results.append(await coro)
+        return results
+
+    async def _analyze_frame(
+        self,
+        frame: dict,
+        client: LlamaCppClient,
+        prompt: str,
+        max_tokens: int,
+        resize: tuple[int, int],
+    ) -> dict:
+        """分析单帧：resize → base64 → VL 推理 → JSON 解析。"""
+        try:
+            # resize 帧（原始 JPEG 重新解码缩放）
+            img = cv2.imread(frame["path"])
+            if img is None:
+                raise ValueError(f"无法读取帧图片: {frame['path']}")
+            # resize 参数为 (width, height)；img.shape 为 (height, width, ch)
+            if img.shape[:2] != (resize[1], resize[0]):
+                img = cv2.resize(img, resize)
+                # 编码为临时 JPEG bytes 发送，不写盘
+                _, buf = cv2.imencode(
+                    ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85]
+                )
+                img_b64 = base64.b64encode(buf.tobytes()).decode()
+            else:
+                # 直接读原文件
+                img_b64 = base64.b64encode(
+                    Path(frame["path"]).read_bytes()
+                ).decode()
+
+            raw = await client.vision_chat_b64(
+                prompt=prompt,
+                image_b64=img_b64,
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+
+            # JSON 容错解析
             try:
                 analysis = json.loads(raw)
             except json.JSONDecodeError:
-                start = raw.find("{")
-                end = raw.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    analysis = json.loads(raw[start : end + 1])
+                s, e = raw.find("{"), raw.rfind("}")
+                if s != -1 and e > s:
+                    analysis = json.loads(raw[s:e+1])
                 else:
-                    raise ValueError(f"未找到 JSON: {raw[:200]}")
-        except (json.JSONDecodeError, ValueError, Exception) as exc:
-            logger.warning(
-                f"[Stage1] 帧 {frame['frame_idx']} 分析失败: {exc}，使用默认值"
-            )
+                    raise ValueError(f"无有效 JSON: {raw[:100]}")
+
+        except Exception as exc:
+            logger.warning(f"[Stage1] 帧 {frame['frame_idx']} 分析失败: {exc}")
             analysis = {
                 "scene_desc": "",
                 "main_subject": "",
@@ -125,100 +319,35 @@ class VideoUnderstanding:
 
         return {**frame, **analysis}
 
-    async def analyze_video(
-        self,
-        video_path: str,
-        fps_sample: Optional[float] = None,
-    ) -> list[dict]:
-        """端到端分析视频，返回场景列表。
-
-        先抽帧，再并发分析，最后合并连续帧为场景。
-
-        Args:
-            video_path: 视频文件路径。
-            fps_sample: 覆盖默认抽帧频率（可选）。
-
-        Returns:
-            场景列表，每项包含 ``start``、``end``、``avg_highlight_score`` 等字段。
-        """
-        frames = self.extract_frames(video_path, fps_sample)
-        if not frames:
-            logger.warning("[Stage1] 未抽到任何帧，返回空场景列表")
-            return []
-
-        sem = asyncio.Semaphore(self._max_concurrent)
-
-        async def _bounded_analyze(frame: dict) -> dict:
-            async with sem:
-                return await self.analyze_frame(frame)
-
-        tasks = [_bounded_analyze(f) for f in frames]
-        analyzed: list[dict] = []
-        for coro in async_tqdm.as_completed(tasks, desc="视频帧分析", total=len(tasks)):
-            result = await coro
-            analyzed.append(result)
-
-        # 按原始帧序号排序（as_completed 不保证顺序）
-        analyzed.sort(key=lambda x: x["frame_idx"])
-
-        scenes = self._merge_scenes(analyzed)
-        logger.success(f"[Stage1] 分析完成，共识别 {len(scenes)} 个场景")
-        return scenes
-
     # ------------------------------------------------------------------
-    # 内部辅助
+    # 场景合并
     # ------------------------------------------------------------------
 
     def _merge_scenes(self, analyzed_frames: list[dict]) -> list[dict]:
-        """将连续帧合并为场景，计算平均高光分。
-
-        合并策略：相邻帧之间时间间隔 ≤ 3 秒且情绪相同则归为同一场景。
-
-        Args:
-            analyzed_frames: 已分析的帧列表（按时间升序）。
-
-        Returns:
-            场景列表，每项格式::
-
-                {
-                    "start":              float,
-                    "end":                float,
-                    "scene_desc":         str,
-                    "main_subject":       str,
-                    "action":             str,
-                    "emotion":            str,
-                    "avg_highlight_score": float,
-                    "has_cut_point":      bool,
-                    "frame_count":        int,
-                }
-        """
+        """将连续帧合并为场景（时间间隔≤3s 且情绪相同）。"""
         if not analyzed_frames:
             return []
 
         scenes: list[dict] = []
-        current_frames: list[dict] = [analyzed_frames[0]]
+        current: list[dict] = [analyzed_frames[0]]
 
         for frame in analyzed_frames[1:]:
-            prev = current_frames[-1]
+            prev = current[-1]
             gap = frame["timestamp"] - prev["timestamp"]
-            same_emotion = frame.get("emotion") == prev.get("emotion")
-
-            if gap <= 3.0 and same_emotion:
-                current_frames.append(frame)
+            if gap <= 3.0 and frame.get("emotion") == prev.get("emotion"):
+                current.append(frame)
             else:
-                scenes.append(self._build_scene(current_frames))
-                current_frames = [frame]
+                scenes.append(self._build_scene(current))
+                current = [frame]
 
-        # 最后一个场景
-        scenes.append(self._build_scene(current_frames))
+        scenes.append(self._build_scene(current))
         return scenes
 
     @staticmethod
     def _build_scene(frames: list[dict]) -> dict:
-        """从帧列表构建单个场景字典。"""
         scores = [f.get("highlight_score", 0) for f in frames]
-        avg_score = sum(scores) / len(scores) if scores else 0.0
-        rep = frames[len(frames) // 2]  # 取中间帧作为代表
+        avg = sum(scores) / len(scores) if scores else 0.0
+        rep = frames[len(frames) // 2]
         return {
             "start": frames[0]["timestamp"],
             "end": frames[-1]["timestamp"],
@@ -226,16 +355,16 @@ class VideoUnderstanding:
             "main_subject": rep.get("main_subject", ""),
             "action": rep.get("action", ""),
             "emotion": rep.get("emotion", "neutral"),
-            "avg_highlight_score": round(avg_score, 2),
+            "avg_highlight": round(avg, 2),
             "has_cut_point": any(f.get("cut_point", False) for f in frames),
             "frame_count": len(frames),
+            "frames": frames,
         }
 
 
 # ------------------------------------------------------------------
 # 独立测试入口
 # ------------------------------------------------------------------
-
 if __name__ == "__main__":
     import sys
     import yaml
@@ -246,21 +375,23 @@ if __name__ == "__main__":
             sys.exit(1)
 
         with open("config/model_config.yaml", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
+            cfg = yaml.safe_load(f)
 
-        from utils.llm_client import create_clients
-        vl_client, _ = create_clients(config)
+        from utils.llm_client import create_clients, create_fast_client
+        vl_client, _ = create_clients(cfg)
+        fast_client = create_fast_client(cfg)
 
         try:
-            stage1 = VideoUnderstanding(vl_client, config)
+            stage1 = VideoUnderstanding(vl_client, cfg, fast_vl_client=fast_client)
             scenes = await stage1.analyze_video(sys.argv[1])
-            for i, scene in enumerate(scenes, 1):
+            for i, s in enumerate(scenes, 1):
                 print(
-                    f"场景 {i:02d} [{scene['start']:.1f}s - {scene['end']:.1f}s]  "
-                    f"亮点分: {scene['avg_highlight_score']}  "
-                    f"{scene['scene_desc'][:50]}"
+                    f"场景{i:03d} [{s['start']:.1f}s-{s['end']:.1f}s]  "
+                    f"亮点={s['avg_highlight']}  {s['scene_desc'][:50]}"
                 )
         finally:
             await vl_client.close()
+            if fast_client is not vl_client:
+                await fast_client.close()
 
     asyncio.run(_test())
