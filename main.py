@@ -56,6 +56,7 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
     from utils.llm_client import create_clients
     from utils.vram_manager import VRAMManager
     from pipeline.stage1_understanding import VideoUnderstanding
+    from pipeline.narrative_analyzer import NarrativeAnalyzer
     from pipeline.stage2_scriptgen import ScriptGenerator
     from pipeline.stage3_tts import TTSEngine
     from pipeline.stage4_editing import VideoEditor
@@ -87,9 +88,18 @@ async def run_pipeline(args: argparse.Namespace, config: dict) -> None:
         logger.info("=" * 60)
         logger.info(f"Stage 2/4 ▶ 解说脚本生成（风格: {args.style}）")
         t2 = time.time()
+
+        narrative_analyzer = NarrativeAnalyzer(
+            script_client, coherence_threshold=args.coherence_threshold
+        )
         stage2 = ScriptGenerator(script_client, style=args.style, config=config)
-        script = await stage2.generate(scenes)
-        logger.info(f"Stage 2 完成，生成 {len(script)} 段脚本  ({time.time()-t2:.1f}s)")
+        selected_scenes, script, coherence_score = await stage2.generate_with_coherence(
+            scenes, narrative_analyzer, target_duration=args.target_duration
+        )
+        logger.info(f"Stage 2 完成，生成 {len(script)} 段脚本，筛选后场景 {len(selected_scenes)} 个  ({time.time()-t2:.1f}s)")
+        logger.info(
+            f"连贯性评分: {coherence_score.get('total_score', 0.0):.1f} / 10.0"
+        )
         vram.log_status()
 
     finally:
@@ -154,6 +164,7 @@ def main() -> None:
   python main.py --input game.mp4 --output result.mp4 --style game
   python main.py --input vlog.mp4 --style vlog --ref-audio myvoice.wav
   python main.py --input sports.mp4 --fps 2.0 --style sports --no-subtitle
+  python main.py --input movie.mp4 --style doc --target-duration 120 --coherence-threshold 8.0
         """,
     )
     parser.add_argument("--input", required=True, help="输入视频路径")
@@ -175,6 +186,14 @@ def main() -> None:
     parser.add_argument(
         "--no-subtitle", action="store_true",
         help="跳过字幕生成与烧录",
+    )
+    parser.add_argument(
+        "--target-duration", type=float, default=0.0,
+        help="目标视频时长（秒），0 表示保留所有必要场景（默认 0）",
+    )
+    parser.add_argument(
+        "--coherence-threshold", type=float, default=7.0,
+        help="连贯性评分阈值，低于此值时记录警告（默认 7.0）",
     )
     parser.add_argument(
         "--config", default="config/model_config.yaml",
